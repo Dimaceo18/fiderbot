@@ -105,10 +105,9 @@ def main_menu_kb():
 
 
 # =========================
-# FONTS
+# FONTS - ВЕЗДЕ ИСПОЛЬЗУЕМ INTER-BLACK
 # =========================
-FONT_MONTSERRAT_BLACK = "Montserrat-Black.ttf"
-FONT_CHP = "Montserrat-Black.ttf"
+FONT_MAIN = "Inter-Black.ttf"  # Единый шрифт для всего
 FOOTER_TEXT = "FEEDER.NEWS"
 
 TARGET_W, TARGET_H = 750, 938  # 4:5 для постов
@@ -195,7 +194,7 @@ def extract_source_url(text: str) -> str:
 
 
 def ensure_fonts():
-    fonts = [FONT_MONTSERRAT_BLACK]
+    fonts = [FONT_MAIN]
     for font in fonts:
         if not os.path.exists(font):
             raise RuntimeError(f"Font not found: {font}")
@@ -420,12 +419,12 @@ def _fit_story_text(draw, text, box, min_size, max_size, line_gap_ratio=0.18, pa
     max_w = x2 - x1
     max_h = y2 - y1
 
-    selected_font = ImageFont.truetype(FONT_MONTSERRAT_BLACK, min_size)
+    selected_font = ImageFont.truetype(FONT_MAIN, min_size)  # Используем Inter-Black
     selected_gap = 8
     selected_paragraph_gap = 12
 
     for size in range(max_size, min_size - 1, -1):
-        font = ImageFont.truetype(FONT_MONTSERRAT_BLACK, size)
+        font = ImageFont.truetype(FONT_MAIN, size)  # Используем Inter-Black
         lines = _wrap_text_preserve_paragraphs(draw, text, font, max_w)
         if not lines:
             continue
@@ -495,7 +494,7 @@ def _draw_story_text(draw, text, box, font, fill=(255, 255, 255), align="center"
 # Card making functions
 # =========================
 def make_fdr_post_card(photo_bytes: bytes, title_text: str, highlight_phrase: str) -> BytesIO:
-    """Создание карточки для поста в стиле ФДР"""
+    """Создание карточки для поста в стиле ФДР с использованием Inter-Black"""
     ensure_fonts()
 
     img = Image.open(BytesIO(photo_bytes)).convert("RGB")
@@ -516,10 +515,11 @@ def make_fdr_post_card(photo_bytes: bytes, title_text: str, highlight_phrase: st
     
     title_max_h = int(img.height * 0.23)
     
+    # Используем Inter-Black для текста поста
     font, lines, heights, spacing, total_h = fit_text_block(
         draw=draw,
         text=title_text_upper,
-        font_path=FONT_CHP,
+        font_path=FONT_MAIN,  # Inter-Black.ttf
         safe_w=safe_w,
         max_block_h=title_max_h,
         max_lines=6,
@@ -572,8 +572,8 @@ def make_fdr_post_card(photo_bytes: bytes, title_text: str, highlight_phrase: st
         
         y += heights[line_idx] + spacing
     
-    # Добавляем подпись FEEDER.NEWS
-    footer_font = ImageFont.truetype(FONT_MONTSERRAT_BLACK, 30)
+    # Добавляем подпись FEEDER.NEWS (тоже Inter-Black)
+    footer_font = ImageFont.truetype(FONT_MAIN, 30)
     footer_bbox = draw.textbbox((0, 0), FOOTER_TEXT, font=footer_font)
     footer_w = footer_bbox[2] - footer_bbox[0]
     footer_x = (img.width - footer_w) // 2
@@ -587,7 +587,7 @@ def make_fdr_post_card(photo_bytes: bytes, title_text: str, highlight_phrase: st
 
 
 def make_fdr_story_card(photo_bytes: bytes, title: str, body_text: str) -> BytesIO:
-    """Создание карточки для сторис в стиле ФДР"""
+    """Создание карточки для сторис в стиле ФДР с использованием Inter-Black"""
     ensure_fonts()
 
     canvas = Image.new("RGB", (FDR_STORY_W, FDR_STORY_H), (0, 0, 0))
@@ -620,6 +620,7 @@ def make_fdr_story_card(photo_bytes: bytes, title: str, body_text: str) -> Bytes
     header_box = (padding, photo_h + padding, FDR_STORY_W - padding, photo_h + header_h - padding)
     body_box = (padding, photo_h + header_h + padding, FDR_STORY_W - padding, FDR_STORY_H - padding)
 
+    # Для заголовка сторис используем Inter-Black
     title_font, title_gap, title_paragraph_gap = _fit_story_text(
         draw, title, header_box, min_size=28, max_size=54,
         line_gap_ratio=0.08, paragraph_gap_ratio=0.18
@@ -629,6 +630,7 @@ def make_fdr_story_card(photo_bytes: bytes, title: str, body_text: str) -> Bytes
                      align="center", valign="center", line_gap=title_gap,
                      paragraph_gap_extra=title_paragraph_gap)
 
+    # Для основного текста сторис тоже Inter-Black
     body_font, body_gap, body_paragraph_gap = _fit_story_text(
         draw, body_text, body_box, min_size=14, max_size=30,
         line_gap_ratio=0.10, paragraph_gap_ratio=0.32
@@ -638,8 +640,8 @@ def make_fdr_story_card(photo_bytes: bytes, title: str, body_text: str) -> Bytes
                      align="left", valign="top", line_gap=body_gap,
                      paragraph_gap_extra=body_paragraph_gap)
 
-    # Добавляем подпись FEEDER.NEWS
-    footer_font = ImageFont.truetype(FONT_MONTSERRAT_BLACK, 30)
+    # Добавляем подпись FEEDER.NEWS (тоже Inter-Black)
+    footer_font = ImageFont.truetype(FONT_MAIN, 30)
     footer_bbox = draw.textbbox((0, 0), FOOTER_TEXT, font=footer_font)
     footer_w = footer_bbox[2] - footer_bbox[0]
     footer_x = (FDR_STORY_W - footer_w) // 2
@@ -895,8 +897,8 @@ def cmd_start(message):
         message.chat.id,
         "👋 <b>Добро пожаловать в Feeder Bot!</b>\n\n"
         "<b>📝 Доступные функции:</b>\n"
-        "• Оформление постов в стиле ФДР\n"
-        "• Оформление сторис в стиле ФДР\n"
+        "• Оформление постов в стиле ФДР (шрифт Inter Black)\n"
+        "• Оформление сторис в стиле ФДР (шрифт Inter Black)\n"
         "• Улучшение качества фото\n\n"
         "Выбери действие 👇",
         parse_mode="HTML",
@@ -910,7 +912,7 @@ def cmd_post(message):
     user_state[uid] = {"step": "waiting_post_photo", "type": "post"}
     bot.send_message(
         message.chat.id, 
-        "📸 <b>Создание поста</b>\n\nПришли фото для поста:", 
+        "📸 <b>Создание поста (шрифт Inter Black)</b>\n\nПришли фото для поста:", 
         parse_mode="HTML",
         reply_markup=main_menu_kb()
     )
@@ -922,7 +924,7 @@ def cmd_story(message):
     user_state[uid] = {"step": "waiting_story_photo", "type": "story"}
     bot.send_message(
         message.chat.id, 
-        "📱 <b>Создание сторис</b>\n\nПришли фото для сторис:", 
+        "📱 <b>Создание сторис (шрифт Inter Black)</b>\n\nПришли фото для сторис:", 
         parse_mode="HTML",
         reply_markup=main_menu_kb()
     )
@@ -1035,7 +1037,7 @@ def on_photo_or_document(message):
             st["step"] = "waiting_post_title"
             user_state[uid] = st
 
-            bot.reply_to(message, "📸 Фото сохранено!\n\nТеперь отправь <b>ЗАГОЛОВОК</b> поста:", parse_mode="HTML")
+            bot.reply_to(message, "📸 Фото сохранено!\n\nТеперь отправь <b>ЗАГОЛОВОК</b> поста (будет использован шрифт Inter Black):", parse_mode="HTML")
             return
         except Exception as e:
             logger.error(f"Error processing photo for post: {e}")
@@ -1062,7 +1064,7 @@ def on_photo_or_document(message):
             st["step"] = "waiting_story_title"
             user_state[uid] = st
 
-            bot.reply_to(message, "📸 Фото сохранено!\n\nТеперь отправь <b>ЗАГОЛОВОК</b> для сторис:", parse_mode="HTML")
+            bot.reply_to(message, "📸 Фото сохранено!\n\nТеперь отправь <b>ЗАГОЛОВОК</b> для сторис (шрифт Inter Black):", parse_mode="HTML")
             return
         except Exception as e:
             logger.error(f"Error processing photo for story: {e}")
@@ -1105,7 +1107,7 @@ def on_text(message):
         
         bot.reply_to(
             message, 
-            f"✅ Заголовок сохранён!\n\n<b>{html.escape(text)}</b>\n\n🎯 Теперь отправь <b>ФРАЗУ</b>, которую нужно выделить фиолетовой плашкой:", 
+            f"✅ Заголовок сохранён! (шрифт Inter Black)\n\n<b>{html.escape(text)}</b>\n\n🎯 Теперь отправь <b>ФРАЗУ</b>, которую нужно выделить фиолетовой плашкой:", 
             parse_mode="HTML"
         )
         return
@@ -1130,12 +1132,12 @@ def on_text(message):
         st["body_raw"] = text
         
         try:
-            # Создаем карточку
+            # Создаем карточку с шрифтом Inter Black
             card = make_fdr_post_card(st["photo_bytes"], st["title"], st["highlight_phrase"])
             
             # Отправляем готовое фото
             caption = build_caption_html(st["title"], st["body_raw"])
-            bot.send_photo(
+            msg = bot.send_photo(
                 chat_id=message.chat.id, 
                 photo=card, 
                 caption=caption, 
@@ -1151,6 +1153,7 @@ def on_text(message):
             # Сохраняем данные для возможного редактирования
             st["step"] = "waiting_post_action"
             st["card_bytes"] = card.getvalue()
+            st["preview_message_id"] = msg.message_id
             user_state[uid] = st
             
         except Exception as e:
@@ -1238,7 +1241,7 @@ def on_text(message):
         st["step"] = "waiting_story_body"
         user_state[uid] = st
         
-        bot.reply_to(message, f"✅ Заголовок сохранён!\n\nТеперь отправь <b>ОСНОВНОЙ ТЕКСТ</b> для сторис:", parse_mode="HTML")
+        bot.reply_to(message, f"✅ Заголовок сохранён! (шрифт Inter Black)\n\nТеперь отправь <b>ОСНОВНОЙ ТЕКСТ</b> для сторис:", parse_mode="HTML")
         return
     
     if step == "waiting_story_body":
@@ -1249,7 +1252,7 @@ def on_text(message):
         st["body_raw"] = text
         
         try:
-            # Создаем карточку для сторис
+            # Создаем карточку для сторис с шрифтом Inter Black
             card = make_fdr_story_card(st["photo_bytes"], st["title"], st["body_raw"])
             
             # Отправляем готовое фото
