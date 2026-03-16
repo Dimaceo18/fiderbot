@@ -108,7 +108,6 @@ def main_menu_kb():
 # FONTS - ВЕЗДЕ ИСПОЛЬЗУЕМ INTER-BLACK
 # =========================
 FONT_MAIN = "Inter-Black.ttf"  # Единый шрифт для всего
-FOOTER_TEXT = "FEEDER.NEWS"
 
 TARGET_W, TARGET_H = 750, 938  # 4:5 для постов
 CHP_GRADIENT_PCT = 0.48
@@ -494,7 +493,7 @@ def _draw_story_text(draw, text, box, font, fill=(255, 255, 255), align="center"
 # Card making functions
 # =========================
 def make_fdr_post_card(photo_bytes: bytes, title_text: str, highlight_phrase: str) -> BytesIO:
-    """Создание карточки для поста в стиле ФДР с использованием Inter-Black"""
+    """Создание карточки для поста в стиле ФДР с использованием Inter-Black (без верхней надписи)"""
     ensure_fonts()
 
     img = Image.open(BytesIO(photo_bytes)).convert("RGB")
@@ -572,14 +571,6 @@ def make_fdr_post_card(photo_bytes: bytes, title_text: str, highlight_phrase: st
         
         y += heights[line_idx] + spacing
     
-    # Добавляем подпись FEEDER.NEWS (тоже Inter-Black)
-    footer_font = ImageFont.truetype(FONT_MAIN, 30)
-    footer_bbox = draw.textbbox((0, 0), FOOTER_TEXT, font=footer_font)
-    footer_w = footer_bbox[2] - footer_bbox[0]
-    footer_x = (img.width - footer_w) // 2
-    footer_y = 20
-    draw.text((footer_x, footer_y), FOOTER_TEXT, font=footer_font, fill=(255, 255, 255, 180))
-    
     out = BytesIO()
     img.save(out, format="JPEG", quality=95, subsampling=0, optimize=True)
     out.seek(0)
@@ -587,7 +578,7 @@ def make_fdr_post_card(photo_bytes: bytes, title_text: str, highlight_phrase: st
 
 
 def make_fdr_story_card(photo_bytes: bytes, title: str, body_text: str) -> BytesIO:
-    """Создание карточки для сторис в стиле ФДР с использованием Inter-Black"""
+    """Создание карточки для сторис в стиле ФДР с использованием Inter-Black (без верхней надписи)"""
     ensure_fonts()
 
     canvas = Image.new("RGB", (FDR_STORY_W, FDR_STORY_H), (0, 0, 0))
@@ -639,14 +630,6 @@ def make_fdr_story_card(photo_bytes: bytes, title: str, body_text: str) -> Bytes
     _draw_story_text(draw, body_text, body_box, body_font, fill=(255, 255, 255),
                      align="left", valign="top", line_gap=body_gap,
                      paragraph_gap_extra=body_paragraph_gap)
-
-    # Добавляем подпись FEEDER.NEWS (тоже Inter-Black)
-    footer_font = ImageFont.truetype(FONT_MAIN, 30)
-    footer_bbox = draw.textbbox((0, 0), FOOTER_TEXT, font=footer_font)
-    footer_w = footer_bbox[2] - footer_bbox[0]
-    footer_x = (FDR_STORY_W - footer_w) // 2
-    footer_y = 20
-    draw.text((footer_x, footer_y), FOOTER_TEXT, font=footer_font, fill=(255, 255, 255, 180))
 
     out = BytesIO()
     canvas.save(out, format="JPEG", quality=92, optimize=True)
