@@ -230,6 +230,46 @@ def tg_file_bytes(file_id: str) -> bytes:
         raise
 
 
+def split_title_and_body(text: str) -> Tuple[str, str]:
+    """Разбивает текст поста на заголовок (первая непустая строка) и тело."""
+    text = (text or "").strip()
+    if not text:
+        return "", ""
+    parts = text.split("\n", 1)
+    title = parts[0].strip()
+    body = parts[1].strip() if len(parts) > 1 else ""
+    return title, body
+
+
+def extract_repost_content(message) -> Optional[Dict]:
+    """
+    Извлекает (title, body, photo_bytes) из репоста/обычного поста.
+    Возвращает None, если не удалось получить фото.
+    """
+    caption = (message.caption or message.text or "").strip()
+    if not caption:
+        return None
+
+    # Фото
+    photo_bytes = None
+    try:
+        if message.content_type == "photo":
+            photo_bytes = tg_file_bytes(message.photo[-1].file_id)
+        elif message.content_type == "document" and message.document:
+            mime = message.document.mime_type or ""
+            if mime.startswith("image/"):
+                photo_bytes = tg_file_bytes(message.document.file_id)
+    except Exception as e:
+        logger.error(f"extract_repost_content: cannot get photo: {e}")
+        return None
+
+    if not photo_bytes:
+        return None
+
+    title, body = split_title_and_body(caption)
+    return {"title": title, "body": body, "photo_bytes": photo_bytes}
+
+
 # =========================
 # Image enhancement
 # =========================
@@ -883,6 +923,8 @@ def cmd_start(message):
         "• Оформление постов в стиле ФДР (шрифт Inter Black)\n"
         "• Оформление сторис в стиле ФДР (шрифт Inter Black)\n"
         "• Улучшение качества фото\n\n"
+        "<b>🚀 Быстрый старт:</b> просто перешли пост из канала "
+        "или отправь фото с подписью — я сразу возьму его в работу.\n\n"
         "Выбери действие 👇",
         parse_mode="HTML",
         reply_markup=main_menu_kb()
@@ -961,6 +1003,45 @@ def on_photo_or_document(message):
     st = user_state.get(uid) or {"step": "idle"}
     
     step = st.get("step")
+
+    # === АВТО-ПРИЁМ РЕПОСТА / ПОСТА С ПОДПИСЬЮ ===
+    # Если пользователь в idle и прислал фото с подписью или репост —
+    # сразу берём в обработку как пост.
+    if step in ("idle", "waiting_post_photo", None):
+        caption_text = (message.caption or "").strip()
+        is_forward = bool(getattr(message, "forward_from_chat", None))
+        if caption_text:
+            parsed = extract_repost_content(message)
+            if parsed:
+                st = {
+                    "step": "waiting_post_highlight",
+                    "type": "post",
+                    "photo_bytes": parsed["photo_bytes"],
+                    "title": parsed["title"],
+                    "body_raw": parsed["body"],
+                }
+                user_state[uid] = st
+
+                title_safe = html.escape(parsed["title"] or "—")
+                body_preview = html.escape((parsed["body"] or "")[:200])
+                source_note = "\n\n<i>Пост принят из канала.</i>" if is_forward else ""
+                bot.reply_to(
+                    message,
+                    "✅ Принял пост!\n\n"
+                    f"<b>Заголовок:</b> {title_safe}\n"
+                    f"<b>Текст:</b> {body_preview}{source_note}\n\n"
+                    "💜 Теперь пришли <b>ФРАЗУ</b>, которую нужно выделить фиолетовой плашкой:",
+                    parse_mode="HTML"
+                )
+                return
+            else:
+                bot.reply_to(
+                    message,
+                    "⚠️ В этом сообщении нет фото. Пришли пост с картинкой "
+                    "или используй меню ниже.",
+                    reply_markup=main_menu_kb()
+                )
+                return
     
     # Улучшение фото
     if step == "waiting_enhance_photo":
@@ -1000,7 +1081,7 @@ def on_photo_or_document(message):
             bot.reply_to(message, f"❌ Ошибка при улучшении: {e}")
             return
     
-    # Обработка фото для поста
+    # Обработка фото для поста (когда пользователь вручную по кнопке начал)
     if step == "waiting_post_photo":
         try:
             if message.content_type == "photo":
@@ -1085,9 +1166,19 @@ def on_text(message):
             return
         
         st["title"] = text
+        # Если текст поста уже есть (был передан в репосте) — идём сразу к плашке
+        if st.get("body_raw"):
+            st["step"] = "waiting_post_highlight"
+            user_state[uid] = st
+            bot.reply_to(
+                message,
+                f"✅ Заголовок сохранён!\n\n<b>{html.escape(text)}</b>\n\n"
+                "💜 Теперь пришли <b>ФРАЗУ</b>, которую нужно выделить фиолетовой плашкой:",
+                parse_mode="HTML"
+            )
+            return
         st["step"] = "waiting_post_highlight"
         user_state[uid] = st
-        
         bot.reply_to(
             message, 
             f"✅ Заголовок сохранён! (шрифт Inter Black)\n\n<b>{html.escape(text)}</b>\n\n🎯 Теперь отправь <b>ФРАЗУ</b>, которую нужно выделить фиолетовой плашкой:", 
@@ -1101,9 +1192,35 @@ def on_text(message):
             return
         
         st["highlight_phrase"] = text
+        # Если у нас уже есть тело поста (из репоста) — сразу строим карточку
+        if st.get("body_raw"):
+            try:
+                card = make_fdr_post_card(st["photo_bytes"], st["title"], st["highlight_phrase"])
+                caption = build_caption_html(st["title"], st["body_raw"])
+                msg = bot.send_photo(
+                    chat_id=message.chat.id,
+                    photo=card,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=post_preview_kb()
+                )
+                bot.send_message(
+                    message.chat.id,
+                    "✅ Пост готов! Фото выше можно скачать. Кнопки ниже помогут что-то изменить.",
+                    reply_markup=main_menu_kb()
+                )
+                st["step"] = "waiting_post_action"
+                st["card_bytes"] = card.getvalue()
+                st["preview_message_id"] = msg.message_id
+                user_state[uid] = st
+                return
+            except Exception as e:
+                logger.error(f"Error creating post card from repost: {e}")
+                bot.reply_to(message, f"❌ Ошибка при создании карточки: {e}")
+                return
+        # Иначе — просим основной текст
         st["step"] = "waiting_post_body"
         user_state[uid] = st
-        
         bot.reply_to(message, f"✅ Фраза сохранена!\n\nТеперь отправь <b>ОСНОВНОЙ ТЕКСТ</b> поста:", parse_mode="HTML")
         return
     
