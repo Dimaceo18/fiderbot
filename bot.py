@@ -200,7 +200,10 @@ def adapt_news_with_ai(text: str) -> Optional[str]:
 # =========================
 def signal_handler(sig, frame):
     logger.info("Shutting down gracefully...")
-    bot.stop_polling()
+    try:
+        bot.stop_polling()
+    except:
+        pass
     try:
         if os.path.exists(lock_file):
             os.unlink(lock_file)
@@ -226,11 +229,6 @@ def validate_url(url: str) -> bool:
 
 def check_file_size(file_bytes: bytes) -> bool:
     return len(file_bytes) <= MAX_FILE_SIZE
-
-
-def extract_source_url(text: str) -> str:
-    m = URL_RE.search(text or "")
-    return m.group(1) if m else ""
 
 
 def ensure_fonts():
@@ -274,30 +272,24 @@ def split_title_and_body(text: str) -> Tuple[str, str]:
 
 
 def is_forwarded(message) -> bool:
-    """Проверяет, является ли сообщение пересланным (репост/форвард)."""
     if getattr(message, "forward_from_chat", None):
         return True
     if getattr(message, "forward_from", None):
         return True
-    # Новые версии bot API (7.x) — forward_origin
     if getattr(message, "forward_origin", None):
         return True
     return False
 
 
 def get_message_text(message) -> str:
-    """Достаёт текст сообщения из всех возможных полей."""
-    # caption — подпись к фото/документу
     if getattr(message, "caption", None):
         return message.caption.strip()
-    # text — обычный текст
     if getattr(message, "text", None):
         return message.text.strip()
     return ""
 
 
 def get_photo_bytes(message) -> Optional[bytes]:
-    """Достаёт байты фото из сообщения (photo или document-картинка)."""
     try:
         if message.content_type == "photo" and message.photo:
             return tg_file_bytes(message.photo[-1].file_id)
@@ -771,7 +763,6 @@ def run_http_server():
 # =========================
 def show_ai_choice(chat_id: int, uid: int, title: str, body: str, photo_bytes: bytes,
                    reply_to_msg=None):
-    """Сохраняет состояние и показывает выбор: оригинал / ИИ."""
     user_state[uid] = {
         "step": "waiting_ai_choice",
         "photo_bytes": photo_bytes,
@@ -1083,7 +1074,6 @@ def on_photo_or_document(message):
     # === АВТО-ПРИЁМ: фото + подпись, либо репост ===
     if step in ("idle", "waiting_post_photo", None):
         if caption_text:
-            # Есть подпись/текст — воспринимаем как готовый пост
             photo_bytes = get_photo_bytes(message)
             if not photo_bytes:
                 bot.reply_to(message, "⚠️ Не удалось получить фото. Пришли ещё раз.",
@@ -1097,7 +1087,6 @@ def on_photo_or_document(message):
             show_ai_choice(message.chat.id, uid, title, body, photo_bytes, reply_to_msg=message)
             return
         else:
-            # Фото без текста и не репост → обычный режим
             if not forwarded:
                 bot.reply_to(
                     message,
@@ -1347,29 +1336,80 @@ def on_text(message):
 
 
 # =========================
-# Запуск polling с retry при 409
+# Запуск polling с защитой от 409
 # =========================
+def prepare_telegram_before_polling():
+    """
+    Убирает webhook (если был установлен) и сбрасывает очередь updates,
+    чтобы не конфликтовать с предыдущим экземпляром бота.
+    """
+    try:
+        bot.delete_webhook(drop_pending_updates=False)
+        logger.info("Webhook removed (if existed)")
+    except Exception as e:
+        logger.warning(f"delete_webhook failed: {e}")
+
+
+def wait_for_other_instance(max_wait_sec: int = 90):
+    """
+    Пытается вызвать getUpdates и, если получает 409, значит другой экземпляр
+    ещё работает. Ждём, пока он не умрёт (максимум max_wait_sec секунд).
+    """
+    deadline = time.time() + max_wait_sec
+    delay = 5
+    while time.time() < deadline:
+        try:
+            bot.get_updates(limit=1, timeout=1)
+            logger.info("Telegram is free, starting polling")
+            return True
+        except ApiTelegramException as e:
+            if e.error_code == 409:
+                remaining = int(deadline - time.time())
+                logger.warning(
+                    f"409 Conflict: другой экземпляр ещё работает. "
+                    f"Ждём {delay}s (осталось {remaining}s)..."
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+            else:
+                logger.error(f"Unexpected Telegram error during wait: {e}")
+                return True  # не 409 — пробуем polling
+        except Exception as e:
+            logger.error(f"Wait error: {e}")
+            time.sleep(delay)
+            delay = min(delay * 2, 30)
+    logger.warning("Не дождались освобождения Telegram, пробуем polling всё равно")
+    return False
+
+
 def start_polling_with_retry():
-    max_retries = 20
+    """Запускает polling с обработкой 409 Conflict."""
+    max_retries = 30
     delay = 5
     attempt = 0
     while attempt < max_retries:
         attempt += 1
         try:
             logger.info(f"Starting polling (attempt {attempt})...")
-            bot.infinity_polling(timeout=60, long_polling_timeout=60, logger_level=logging.ERROR)
+            bot.infinity_polling(
+                timeout=60,
+                long_polling_timeout=60,
+                logger_level=logging.ERROR,
+                skip_pending=True,
+            )
             return
         except ApiTelegramException as e:
             if e.error_code == 409:
                 logger.warning(
-                    f"409 Conflict: another instance is polling. "
+                    f"409 Conflict: другой экземпляр держит polling. "
                     f"Retry in {delay}s (attempt {attempt}/{max_retries})..."
                 )
                 time.sleep(delay)
                 delay = min(delay * 2, 120)
             else:
                 logger.error(f"Telegram API error: {e}")
-                raise
+                time.sleep(delay)
+                delay = min(delay * 2, 120)
         except Exception as e:
             logger.error(f"Polling error: {e}")
             time.sleep(delay)
@@ -1389,6 +1429,11 @@ if __name__ == "__main__":
         http_thread = threading.Thread(target=run_http_server, daemon=True)
         http_thread.start()
         logger.info("🌐 Health check started")
+
+        # Подготовка: снимаем webhook, ждём освобождения Telegram
+        prepare_telegram_before_polling()
+        wait_for_other_instance(max_wait_sec=90)
+
         logger.info("🤖 Bot polling...")
         start_polling_with_retry()
     except Exception as e:
