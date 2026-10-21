@@ -30,7 +30,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Мягкий импорт openai — чтобы бот не падал, если пакета нет
+# Мягкий импорт openai
 try:
     from openai import OpenAI
     OPENAI_AVAILABLE = True
@@ -171,11 +171,9 @@ AI_NEWS_PROMPT = """Ты — редактор новостной ленты. П�
 
 
 def adapt_news_with_ai(text: str) -> Optional[str]:
-    """Отправляет текст в DeepSeek и возвращает короткую новость (одна строка)."""
     if not deepseek_client:
         logger.error("DeepSeek client is not initialized")
         return None
-
     try:
         response = deepseek_client.chat.completions.create(
             model="deepseek-flash",
@@ -275,29 +273,41 @@ def split_title_and_body(text: str) -> Tuple[str, str]:
     return title, body
 
 
-def extract_repost_content(message) -> Optional[Dict]:
-    """Извлекает (title, body, photo_bytes) из репоста/поста."""
-    caption = (message.caption or message.text or "").strip()
-    if not caption:
-        return None
+def is_forwarded(message) -> bool:
+    """Проверяет, является ли сообщение пересланным (репост/форвард)."""
+    if getattr(message, "forward_from_chat", None):
+        return True
+    if getattr(message, "forward_from", None):
+        return True
+    # Новые версии bot API (7.x) — forward_origin
+    if getattr(message, "forward_origin", None):
+        return True
+    return False
 
-    photo_bytes = None
+
+def get_message_text(message) -> str:
+    """Достаёт текст сообщения из всех возможных полей."""
+    # caption — подпись к фото/документу
+    if getattr(message, "caption", None):
+        return message.caption.strip()
+    # text — обычный текст
+    if getattr(message, "text", None):
+        return message.text.strip()
+    return ""
+
+
+def get_photo_bytes(message) -> Optional[bytes]:
+    """Достаёт байты фото из сообщения (photo или document-картинка)."""
     try:
-        if message.content_type == "photo":
-            photo_bytes = tg_file_bytes(message.photo[-1].file_id)
-        elif message.content_type == "document" and message.document:
+        if message.content_type == "photo" and message.photo:
+            return tg_file_bytes(message.photo[-1].file_id)
+        if message.content_type == "document" and message.document:
             mime = message.document.mime_type or ""
             if mime.startswith("image/"):
-                photo_bytes = tg_file_bytes(message.document.file_id)
+                return tg_file_bytes(message.document.file_id)
     except Exception as e:
-        logger.error(f"extract_repost_content: cannot get photo: {e}")
-        return None
-
-    if not photo_bytes:
-        return None
-
-    title, body = split_title_and_body(caption)
-    return {"title": title, "body": body, "photo_bytes": photo_bytes}
+        logger.error(f"get_photo_bytes error: {e}")
+    return None
 
 
 # =========================
@@ -561,7 +571,7 @@ def make_fdr_post_card(photo_bytes: bytes, title_text: str, highlight_phrase: st
 
 
 # =========================
-# Card: сторис (старый формат)
+# Card: сторис (старый)
 # =========================
 def make_fdr_story_card(photo_bytes: bytes, title: str, body_text: str) -> BytesIO:
     ensure_fonts()
@@ -607,8 +617,7 @@ def make_fdr_story_card(photo_bytes: bytes, title: str, body_text: str) -> Bytes
 
 
 # =========================
-# Card: сторис-новость (белый фон, фото по центру,
-# новость внизу крупным чёрным, выделение — фиолетовым)
+# Card: сторис-новость
 # =========================
 def make_news_story_card(photo_bytes: bytes, news_text: str, highlight_phrase: str) -> BytesIO:
     ensure_fonts()
@@ -758,6 +767,33 @@ def run_http_server():
 
 
 # =========================
+# Показ выбора ИИ
+# =========================
+def show_ai_choice(chat_id: int, uid: int, title: str, body: str, photo_bytes: bytes,
+                   reply_to_msg=None):
+    """Сохраняет состояние и показывает выбор: оригинал / ИИ."""
+    user_state[uid] = {
+        "step": "waiting_ai_choice",
+        "photo_bytes": photo_bytes,
+        "title": title,
+        "body_raw": body,
+        "type": "post",
+    }
+    title_safe = html.escape(title or "—")
+    body_preview = html.escape((body or "")[:200])
+    text = (
+        "✅ Принял пост!\n\n"
+        f"<b>Заголовок:</b> {title_safe}\n"
+        f"<b>Текст:</b> {body_preview}\n\n"
+        "🤖 Оставить оригинальный текст или адаптировать через ИИ в короткую новость?"
+    )
+    if reply_to_msg is not None:
+        bot.reply_to(reply_to_msg, text, parse_mode="HTML", reply_markup=ai_choice_kb())
+    else:
+        bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=ai_choice_kb())
+
+
+# =========================
 # Callback handlers
 # =========================
 @bot.callback_query_handler(func=lambda c: True)
@@ -793,7 +829,7 @@ def on_action(call):
             bot.edit_message_text(
                 chat_id=call.message.chat.id,
                 message_id=call.message.message_id,
-                text="❌ ИИ недоступен (не настроен DEEPSEEK_API_KEY или нет пакета openai).\n\n"
+                text="❌ ИИ недоступен (нет DEEPSEEK_API_KEY или пакета openai).\n\n"
                      "Выбери формат с оригинальным текстом:",
                 reply_markup=format_choice_kb()
             )
@@ -970,7 +1006,7 @@ def cmd_start(message):
         "• Оформление постов и сторис\n"
         "• Адаптация текста в короткую новость через ИИ\n"
         "• Улучшение качества фото\n\n"
-        "<b>🚀 Быстрый старт:</b> просто перешли пост из канала "
+        "<b>🚀 Быстрый старт:</b> перешли пост из канала "
         "или отправь фото с подписью.",
         parse_mode="HTML",
         reply_markup=main_menu_kb()
@@ -1024,35 +1060,50 @@ def on_photo_or_document(message):
     uid = message.from_user.id
     st = user_state.get(uid) or {"step": "idle"}
     step = st.get("step")
+    caption_text = get_message_text(message)
+    forwarded = is_forwarded(message)
 
-    # === АВТО-ПРИЁМ РЕПОСТА ===
+    # === Досылка фото к репосту без фото ===
+    if step == "waiting_repost_photo":
+        photo_bytes = get_photo_bytes(message)
+        if not photo_bytes:
+            bot.reply_to(message, "❌ Пришли JPG/PNG фото.")
+            return
+        if not check_file_size(photo_bytes):
+            bot.reply_to(message, "❌ Файл > 20MB.")
+            return
+        warn_if_too_small(message.chat.id, photo_bytes)
+        show_ai_choice(
+            message.chat.id, uid,
+            st.get("title", ""), st.get("body_raw", ""),
+            photo_bytes, reply_to_msg=message
+        )
+        return
+
+    # === АВТО-ПРИЁМ: фото + подпись, либо репост ===
     if step in ("idle", "waiting_post_photo", None):
-        caption_text = (message.caption or "").strip()
         if caption_text:
-            parsed = extract_repost_content(message)
-            if parsed:
-                st = {
-                    "step": "waiting_ai_choice",
-                    "type": "post",
-                    "photo_bytes": parsed["photo_bytes"],
-                    "title": parsed["title"],
-                    "body_raw": parsed["body"],
-                }
-                user_state[uid] = st
-                title_safe = html.escape(parsed["title"] or "—")
-                body_preview = html.escape((parsed["body"] or "")[:200])
+            # Есть подпись/текст — воспринимаем как готовый пост
+            photo_bytes = get_photo_bytes(message)
+            if not photo_bytes:
+                bot.reply_to(message, "⚠️ Не удалось получить фото. Пришли ещё раз.",
+                             reply_markup=main_menu_kb())
+                return
+            if not check_file_size(photo_bytes):
+                bot.reply_to(message, "❌ Файл > 20MB.")
+                return
+            warn_if_too_small(message.chat.id, photo_bytes)
+            title, body = split_title_and_body(caption_text)
+            show_ai_choice(message.chat.id, uid, title, body, photo_bytes, reply_to_msg=message)
+            return
+        else:
+            # Фото без текста и не репост → обычный режим
+            if not forwarded:
                 bot.reply_to(
                     message,
-                    "✅ Принял пост!\n\n"
-                    f"<b>Заголовок:</b> {title_safe}\n"
-                    f"<b>Текст:</b> {body_preview}\n\n"
-                    "🤖 Оставить оригинальный текст или адаптировать через ИИ в короткую новость?",
-                    parse_mode="HTML",
-                    reply_markup=ai_choice_kb()
+                    "⚠️ К фото нет текста. Пришли пост с текстом или выбери действие в меню 👇",
+                    reply_markup=main_menu_kb()
                 )
-                return
-            else:
-                bot.reply_to(message, "⚠️ Нет фото. Пришли пост с картинкой.", reply_markup=main_menu_kb())
                 return
 
     # Улучшение
@@ -1084,11 +1135,10 @@ def on_photo_or_document(message):
     # Фото для поста (ручной режим)
     if step == "waiting_post_photo":
         try:
-            if message.content_type == "photo":
-                file_id = message.photo[-1].file_id
-            else:
-                file_id = message.document.file_id
-            photo_bytes = tg_file_bytes(file_id)
+            photo_bytes = get_photo_bytes(message)
+            if not photo_bytes:
+                bot.reply_to(message, "❌ Пришли фото.")
+                return
             if not check_file_size(photo_bytes):
                 bot.reply_to(message, "❌ Файл > 20MB.")
                 return
@@ -1106,11 +1156,10 @@ def on_photo_or_document(message):
     # Фото для сторис (ручной режим)
     if step == "waiting_story_photo":
         try:
-            if message.content_type == "photo":
-                file_id = message.photo[-1].file_id
-            else:
-                file_id = message.document.file_id
-            photo_bytes = tg_file_bytes(file_id)
+            photo_bytes = get_photo_bytes(message)
+            if not photo_bytes:
+                bot.reply_to(message, "❌ Пришли фото.")
+                return
             if not check_file_size(photo_bytes):
                 bot.reply_to(message, "❌ Файл > 20MB.")
                 return
@@ -1134,24 +1183,39 @@ def on_text(message):
     uid = message.from_user.id
     text = (message.text or "").strip()
     st = user_state.get(uid) or {"step": "idle"}
-
-    if text == BTN_POST:
-        cmd_post(message)
-        return
-    if text == BTN_STORY:
-        cmd_story(message)
-        return
-    if text == BTN_ENHANCE:
-        cmd_enhance(message)
-        return
-
     step = st.get("step")
+    forwarded = is_forwarded(message)
+
+    # === Кнопки меню ===
+    if text == BTN_POST:
+        cmd_post(message); return
+    if text == BTN_STORY:
+        cmd_story(message); return
+    if text == BTN_ENHANCE:
+        cmd_enhance(message); return
+
+    # === АВТО-ПРИЁМ РЕПОСТА (только текст, без фото) ===
+    if forwarded and step in ("idle", "waiting_post_action", None):
+        title, body = split_title_and_body(text)
+        user_state[uid] = {
+            "step": "waiting_repost_photo",
+            "type": "post",
+            "title": title,
+            "body_raw": body,
+        }
+        bot.reply_to(
+            message,
+            "✅ Принял пост, но в нём <b>нет фото</b>.\n\n"
+            "📸 Дошли картинку для оформления — и я продолжу:",
+            parse_mode="HTML",
+            reply_markup=main_menu_kb()
+        )
+        return
 
     # === Пост: заголовок ===
     if step == "waiting_post_title":
         if not text:
-            bot.reply_to(message, "❌ Пустой заголовок.")
-            return
+            bot.reply_to(message, "❌ Пустой заголовок."); return
         st["title"] = text
         st["step"] = "waiting_post_highlight"
         user_state[uid] = st
@@ -1162,8 +1226,7 @@ def on_text(message):
     # === Пост: выделение ===
     if step == "waiting_post_highlight":
         if not text:
-            bot.reply_to(message, "❌ Пустая фраза.")
-            return
+            bot.reply_to(message, "❌ Пустая фраза."); return
         st["highlight_phrase"] = text if text.lower() != "нет" else ""
         if st.get("body_raw"):
             try:
@@ -1189,8 +1252,7 @@ def on_text(message):
     # === Пост: тело ===
     if step == "waiting_post_body":
         if not text:
-            bot.reply_to(message, "❌ Пустой текст.")
-            return
+            bot.reply_to(message, "❌ Пустой текст."); return
         st["body_raw"] = text
         try:
             card = make_fdr_post_card(st["photo_bytes"], st["title"], st.get("highlight_phrase", ""))
@@ -1212,8 +1274,7 @@ def on_text(message):
     # === Сторис-новость: выделение ===
     if step == "waiting_news_highlight":
         if not text:
-            bot.reply_to(message, "❌ Пустая фраза.")
-            return
+            bot.reply_to(message, "❌ Пустая фраза."); return
         st["highlight_phrase"] = text if text.lower() != "нет" else ""
         try:
             card = make_news_story_card(st["photo_bytes"], st["news_text"], st.get("highlight_phrase", ""))
@@ -1232,8 +1293,7 @@ def on_text(message):
     # === Сторис-новость: текст ===
     if step == "waiting_news_text":
         if not text:
-            bot.reply_to(message, "❌ Пустой текст.")
-            return
+            bot.reply_to(message, "❌ Пустой текст."); return
         st["news_text"] = text
         try:
             card = make_news_story_card(st["photo_bytes"], st["news_text"], st.get("highlight_phrase", ""))
@@ -1253,8 +1313,7 @@ def on_text(message):
     # === Сторис (старый): заголовок ===
     if step == "waiting_story_title":
         if not text:
-            bot.reply_to(message, "❌ Пустой заголовок.")
-            return
+            bot.reply_to(message, "❌ Пустой заголовок."); return
         st["title"] = text
         st["step"] = "waiting_story_body"
         user_state[uid] = st
@@ -1265,8 +1324,7 @@ def on_text(message):
     # === Сторис (старый): тело ===
     if step == "waiting_story_body":
         if not text:
-            bot.reply_to(message, "❌ Пустой текст.")
-            return
+            bot.reply_to(message, "❌ Пустой текст."); return
         st["body_raw"] = text
         try:
             card = make_fdr_story_card(st["photo_bytes"], st["title"], st["body_raw"])
@@ -1292,7 +1350,6 @@ def on_text(message):
 # Запуск polling с retry при 409
 # =========================
 def start_polling_with_retry():
-    """Запускает polling с обработкой 409 Conflict (перекрытие контейнеров на Render)."""
     max_retries = 20
     delay = 5
     attempt = 0
@@ -1301,11 +1358,11 @@ def start_polling_with_retry():
         try:
             logger.info(f"Starting polling (attempt {attempt})...")
             bot.infinity_polling(timeout=60, long_polling_timeout=60, logger_level=logging.ERROR)
-            return  # нормальный выход (например, stop_polling)
+            return
         except ApiTelegramException as e:
             if e.error_code == 409:
                 logger.warning(
-                    f"409 Conflict: another instance is polling with the same token. "
+                    f"409 Conflict: another instance is polling. "
                     f"Retry in {delay}s (attempt {attempt}/{max_retries})..."
                 )
                 time.sleep(delay)
