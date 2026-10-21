@@ -25,10 +25,18 @@ from telebot.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton
 )
+from telebot.apihelper import ApiTelegramException
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from openai import OpenAI
+
+# Мягкий импорт openai — чтобы бот не падал, если пакета нет
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except ImportError:
+    OPENAI_AVAILABLE = False
+    OpenAI = None
 
 # Проверка на единственный экземпляр
 lock_file = '/tmp/feeder_bot_instance.lock'
@@ -84,6 +92,8 @@ if " " in TOKEN:
     raise ValueError("BOT_TOKEN must not contain spaces")
 if not DEEPSEEK_API_KEY:
     logger.warning("DEEPSEEK_API_KEY is not set. AI adaptation will not work.")
+if not OPENAI_AVAILABLE:
+    logger.warning("openai package is not installed. AI adaptation will not work.")
 
 # Constants
 MAX_FILE_SIZE = 20 * 1024 * 1024
@@ -138,7 +148,7 @@ user_state: Dict[int, Dict] = {}
 
 # DeepSeek client
 deepseek_client = None
-if DEEPSEEK_API_KEY:
+if DEEPSEEK_API_KEY and OPENAI_AVAILABLE:
     deepseek_client = OpenAI(
         api_key=DEEPSEEK_API_KEY,
         base_url="https://api.deepseek.com"
@@ -178,7 +188,6 @@ def adapt_news_with_ai(text: str) -> Optional[str]:
             stream=False
         )
         result = response.choices[0].message.content.strip()
-        # Убираем возможные кавычки по краям
         result = result.strip('"').strip("'").strip()
         if len(result) > 250:
             result = result[:247] + "..."
@@ -598,16 +607,14 @@ def make_fdr_story_card(photo_bytes: bytes, title: str, body_text: str) -> Bytes
 
 
 # =========================
-# Card: сторис-новость (НОВЫЙ ФОРМАТ)
-# фото по центру, ниже новость крупным чёрным шрифтом,
-# выделенная фраза — фиолетовым
+# Card: сторис-новость (белый фон, фото по центру,
+# новость внизу крупным чёрным, выделение — фиолетовым)
 # =========================
 def make_news_story_card(photo_bytes: bytes, news_text: str, highlight_phrase: str) -> BytesIO:
     ensure_fonts()
     canvas = Image.new("RGB", (FDR_STORY_W, FDR_STORY_H), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
 
-    # Фото по центру (квадрат ~720x720)
     photo = Image.open(BytesIO(photo_bytes)).convert("RGB")
     photo_size = 640
     photo_top = 120
@@ -624,24 +631,20 @@ def make_news_story_card(photo_bytes: bytes, news_text: str, highlight_phrase: s
     photo_left = (FDR_STORY_W - photo_size) // 2
     canvas.paste(story_photo, (photo_left, photo_top))
 
-    # Область под новость
     news_top = photo_top + photo_size + 60
     news_box = (50, news_top, FDR_STORY_W - 50, FDR_STORY_H - 80)
 
-    # Подбираем шрифт
     news_font, news_gap, news_paragraph_gap = _fit_story_text(
         draw, news_text.upper(), news_box, min_size=24, max_size=52,
         line_gap_ratio=0.12, paragraph_gap_ratio=0.30
     )
 
-    # Рисуем новость с выделением фиолетовым
     highlight_upper = highlight_phrase.strip().upper()
     highlight_words = set(highlight_upper.split()) if highlight_upper else set()
 
     lines = _wrap_text_preserve_paragraphs(draw, news_text.upper(), news_font, news_box[2] - news_box[0])
     line_h = news_font.getbbox("Ag")[3] - news_font.getbbox("Ag")[1]
 
-    # Вычисляем общую высоту для центрирования
     total_h = 0
     for line in lines:
         total_h += news_paragraph_gap if line == "" else line_h + news_gap
@@ -652,13 +655,11 @@ def make_news_story_card(photo_bytes: bytes, news_text: str, highlight_phrase: s
             y += news_paragraph_gap
             continue
         words = line.split()
-        # Вычисляем ширину строки
         line_w = 0
         for i, w in enumerate(words):
             line_w += text_width(draw, w, news_font)
             if i < len(words) - 1:
                 line_w += text_width(draw, " ", news_font)
-        # Центрируем
         x = news_box[0] + (news_box[2] - news_box[0] - line_w) // 2
         for i, w in enumerate(words):
             color = FDR_POST_PURPLE_COLOR if w in highlight_words else (0, 0, 0)
@@ -770,7 +771,6 @@ def on_action(call):
 
     # === AI выбор ===
     if call.data == "ai_keep_original":
-        # Оставляем оригинальный текст → сразу к формату
         bot.answer_callback_query(call.id, "Ок, оригинальный текст")
         bot.edit_message_text(
             chat_id=call.message.chat.id,
@@ -783,11 +783,22 @@ def on_action(call):
         return
 
     if call.data == "ai_adapt":
-        # Адаптируем через ИИ
         bot.answer_callback_query(call.id, "🤖 Адаптирую через ИИ...")
         original_text = st.get("body_raw") or st.get("title") or ""
         if not original_text:
             bot.send_message(call.message.chat.id, "❌ Нет текста для адаптации.")
+            return
+
+        if not deepseek_client:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text="❌ ИИ недоступен (не настроен DEEPSEEK_API_KEY или нет пакета openai).\n\n"
+                     "Выбери формат с оригинальным текстом:",
+                reply_markup=format_choice_kb()
+            )
+            st["ai_choice"] = "original"
+            user_state[uid] = st
             return
 
         adapted = adapt_news_with_ai(original_text)
@@ -811,8 +822,6 @@ def on_action(call):
     # === Выбор формата ===
     if call.data == "format_post":
         bot.answer_callback_query(call.id, "📝 Пост")
-        text_for_card = st.get("adapted_text") if st.get("ai_choice") == "adapted" else st.get("title", "")
-        # Если адаптировано — заголовок = новость, body = пусто (или тот же)
         if st.get("ai_choice") == "adapted":
             st["title"] = st["adapted_text"]
             st["body_raw"] = ""
@@ -831,7 +840,6 @@ def on_action(call):
         if st.get("ai_choice") == "adapted":
             st["news_text"] = st["adapted_text"]
         else:
-            # Для оригинала в сторис-новости берём весь текст
             st["news_text"] = st.get("body_raw") or st.get("title", "")
         st["step"] = "waiting_news_highlight"
         user_state[uid] = st
@@ -1156,10 +1164,10 @@ def on_text(message):
         if not text:
             bot.reply_to(message, "❌ Пустая фраза.")
             return
-        st["highlight_phrase"] = text
+        st["highlight_phrase"] = text if text.lower() != "нет" else ""
         if st.get("body_raw"):
             try:
-                card = make_fdr_post_card(st["photo_bytes"], st["title"], st["highlight_phrase"])
+                card = make_fdr_post_card(st["photo_bytes"], st["title"], st.get("highlight_phrase", ""))
                 caption = build_caption_html(st["title"], st["body_raw"])
                 msg = bot.send_photo(message.chat.id, photo=card, caption=caption,
                                      parse_mode="HTML", reply_markup=post_preview_kb())
@@ -1185,7 +1193,7 @@ def on_text(message):
             return
         st["body_raw"] = text
         try:
-            card = make_fdr_post_card(st["photo_bytes"], st["title"], st["highlight_phrase"])
+            card = make_fdr_post_card(st["photo_bytes"], st["title"], st.get("highlight_phrase", ""))
             caption = build_caption_html(st["title"], st["body_raw"])
             msg = bot.send_photo(message.chat.id, photo=card, caption=caption,
                                  parse_mode="HTML", reply_markup=post_preview_kb())
@@ -1281,6 +1289,39 @@ def on_text(message):
 
 
 # =========================
+# Запуск polling с retry при 409
+# =========================
+def start_polling_with_retry():
+    """Запускает polling с обработкой 409 Conflict (перекрытие контейнеров на Render)."""
+    max_retries = 20
+    delay = 5
+    attempt = 0
+    while attempt < max_retries:
+        attempt += 1
+        try:
+            logger.info(f"Starting polling (attempt {attempt})...")
+            bot.infinity_polling(timeout=60, long_polling_timeout=60, logger_level=logging.ERROR)
+            return  # нормальный выход (например, stop_polling)
+        except ApiTelegramException as e:
+            if e.error_code == 409:
+                logger.warning(
+                    f"409 Conflict: another instance is polling with the same token. "
+                    f"Retry in {delay}s (attempt {attempt}/{max_retries})..."
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 120)
+            else:
+                logger.error(f"Telegram API error: {e}")
+                raise
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+            time.sleep(delay)
+            delay = min(delay * 2, 120)
+    logger.error("Max retries reached, giving up.")
+    sys.exit(1)
+
+
+# =========================
 # Main
 # =========================
 if __name__ == "__main__":
@@ -1292,7 +1333,7 @@ if __name__ == "__main__":
         http_thread.start()
         logger.info("🌐 Health check started")
         logger.info("🤖 Bot polling...")
-        bot.infinity_polling(timeout=60, long_polling_timeout=60, logger_level=logging.ERROR)
+        start_polling_with_retry()
     except Exception as e:
         logger.error(f"❌ Bot crashed: {e}")
         try:
