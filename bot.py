@@ -123,13 +123,23 @@ user_state: Dict[int, Dict] = {}
 media_groups: Dict[str, Dict] = {}
 media_group_lock = threading.Lock()
 
+# Состояния, из которых разрешён авто-приём нового репоста
+AUTO_STEPS = (
+    "idle",
+    "waiting_post_photo",
+    "waiting_post_action",
+    "waiting_news_story_action",
+    "waiting_story_action",
+    None,
+)
+
 deepseek_client = None
 if DEEPSEEK_API_KEY and OPENAI_AVAILABLE:
     deepseek_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
 
 # =========================
-# AI (исправлено: max_tokens 1500, проверка finish_reason)
+# AI
 # =========================
 AI_NEWS_PROMPT = """Ты — редактор новостной ленты. Преобразуй присланный текст в новость в одну строку по правилам:
 
@@ -155,11 +165,10 @@ def adapt_news_with_ai(text: str) -> Optional[str]:
                 {"role": "user", "content": text}
             ],
             temperature=0.3,
-            max_tokens=1500,  # ← увеличено с 300
+            max_tokens=1500,
             stream=False
         )
         choice = response.choices[0]
-        # Проверяем, не обрезан ли ответ
         if choice.finish_reason == "length":
             logger.error("DeepSeek ответ обрезан: не хватило max_tokens (finish_reason=length)")
             return None
@@ -242,21 +251,15 @@ def clean_markdown(s: str) -> str:
 
 
 def split_title_and_body(text: str) -> Tuple[str, str]:
-    """
-    Заголовок = первая непустая строка. Без ограничения длины.
-    Тело = всё остальное.
-    """
+    """Заголовок = первая непустая строка. Без ограничения длины."""
     text = (text or "").strip()
     if not text:
         return "", ""
-
     lines = text.split("\n")
     while lines and not lines[0].strip():
         lines.pop(0)
-
     if not lines:
         return "", ""
-
     title = clean_markdown(lines[0].strip())
     body = "\n".join(lines[1:]).strip()
     return title, body
@@ -795,10 +798,8 @@ def on_action(call):
         if st.get("ai_choice") == "adapted":
             st["news_text"] = st["adapted_text"]
         else:
-            # ЖЁСТКО: берём первую строку оригинала
             raw = (st.get("body_raw") or "").strip()
             title = (st.get("title") or "").strip()
-
             first_line = ""
             if title:
                 first_line = title
@@ -808,7 +809,6 @@ def on_action(call):
                         first_line = line.strip()
                         break
             st["news_text"] = clean_markdown(first_line)
-
             logger.info(f"STORY first_line='{st['news_text'][:80]}' "
                         f"(title_len={len(title)}, body_len={len(raw)})")
         st["step"] = "waiting_news_highlight"
@@ -839,19 +839,25 @@ def on_action(call):
         bot.edit_message_caption(chat_id=call.message.chat.id, message_id=call.message.message_id,
                                  caption="💜 Пришли новую ФРАЗУ:")
     elif call.data == "restart_post":
-        user_state[uid] = {"step": "waiting_post_photo"}
+        # После «Создать заново» — сбрасываем всё и ждём новое фото/репост
+        user_state[uid] = {"step": "idle"}
         bot.answer_callback_query(call.id, "Заново")
         bot.delete_message(call.message.chat.id, call.message.message_id)
-        bot.send_message(call.message.chat.id, "📸 Пришли фото:", reply_markup=main_menu_kb())
+        bot.send_message(call.message.chat.id,
+                         "🔄 Сброшено. Пришли фото, репост или выбери действие 👇",
+                         reply_markup=main_menu_kb())
     elif call.data == "finish_post":
         bot.answer_callback_query(call.id, "✅")
         bot.send_message(call.message.chat.id, "✅ Готово!", reply_markup=main_menu_kb())
+        # СБРОС: чтобы следующий репост сразу ловился
         user_state[uid] = {"step": "idle"}
     elif call.data == "cancel_post":
         bot.answer_callback_query(call.id, "❌")
         bot.delete_message(call.message.chat.id, call.message.message_id)
         bot.send_message(call.message.chat.id, "Отменено", reply_markup=main_menu_kb())
         user_state[uid] = {"step": "idle"}
+
+    # === Редактирование сторис-новости ===
     elif call.data == "edit_news_text":
         st["step"] = "waiting_news_text"; user_state[uid] = st
         bot.answer_callback_query(call.id, "Ок")
@@ -863,10 +869,12 @@ def on_action(call):
         bot.edit_message_caption(chat_id=call.message.chat.id, message_id=call.message.message_id,
                                  caption="💜 Пришли новую ФРАЗУ:")
     elif call.data == "restart_news_story":
-        user_state[uid] = {"step": "waiting_post_photo"}
+        user_state[uid] = {"step": "idle"}
         bot.answer_callback_query(call.id, "Заново")
         bot.delete_message(call.message.chat.id, call.message.message_id)
-        bot.send_message(call.message.chat.id, "📸 Пришли фото:", reply_markup=main_menu_kb())
+        bot.send_message(call.message.chat.id,
+                         "🔄 Сброшено. Пришли фото, репост или выбери действие 👇",
+                         reply_markup=main_menu_kb())
     elif call.data == "finish_news_story":
         bot.answer_callback_query(call.id, "✅")
         bot.send_message(call.message.chat.id, "✅ Готово!", reply_markup=main_menu_kb())
@@ -876,6 +884,8 @@ def on_action(call):
         bot.delete_message(call.message.chat.id, call.message.message_id)
         bot.send_message(call.message.chat.id, "Отменено", reply_markup=main_menu_kb())
         user_state[uid] = {"step": "idle"}
+
+    # === Сторис (старый) ===
     elif call.data == "edit_story_body":
         st["step"] = "waiting_story_body"; user_state[uid] = st
         bot.answer_callback_query(call.id, "Ок")
@@ -887,10 +897,12 @@ def on_action(call):
         bot.edit_message_caption(chat_id=call.message.chat.id, message_id=call.message.message_id,
                                  caption="📝 Пришли новый заголовок:")
     elif call.data == "restart_story":
-        user_state[uid] = {"step": "waiting_story_photo"}
+        user_state[uid] = {"step": "idle"}
         bot.answer_callback_query(call.id, "Заново")
         bot.delete_message(call.message.chat.id, call.message.message_id)
-        bot.send_message(call.message.chat.id, "📸 Пришли фото:", reply_markup=main_menu_kb())
+        bot.send_message(call.message.chat.id,
+                         "🔄 Сброшено. Пришли фото, репост или выбери действие 👇",
+                         reply_markup=main_menu_kb())
     elif call.data == "finish_story":
         bot.answer_callback_query(call.id, "✅")
         bot.send_message(call.message.chat.id, "✅ Готово!", reply_markup=main_menu_kb())
@@ -900,6 +912,8 @@ def on_action(call):
         bot.delete_message(call.message.chat.id, call.message.message_id)
         bot.send_message(call.message.chat.id, "Отменено", reply_markup=main_menu_kb())
         user_state[uid] = {"step": "idle"}
+
+    # === Улучшение ===
     elif call.data == "enhance_another":
         st["step"] = "waiting_enhance_photo"; user_state[uid] = st
         bot.answer_callback_query(call.id, "Ок")
@@ -1006,6 +1020,7 @@ def on_photo_or_document(message):
     logger.info(f"PHOTO uid={uid} step={step} fwd={forwarded} "
                 f"caption_len={len(caption_text)} mgid={message.media_group_id}")
 
+    # === Медиа-группа ===
     if message.media_group_id:
         gid = message.media_group_id
         with media_group_lock:
@@ -1023,6 +1038,7 @@ def on_photo_or_document(message):
             t.start()
         return
 
+    # === Досылка фото к репосту без фото ===
     if step == "waiting_repost_photo":
         photo_bytes = get_photo_bytes(message)
         if not photo_bytes:
@@ -1036,7 +1052,8 @@ def on_photo_or_document(message):
                        photo_bytes, reply_to_msg=message)
         return
 
-    if step in ("idle", "waiting_post_photo", None):
+    # === АВТО-ПРИЁМ РЕПОСТА / ПОСТА с текстом — из любого финального состояния ===
+    if step in AUTO_STEPS:
         if caption_text:
             photo_bytes = get_photo_bytes(message)
             if not photo_bytes:
@@ -1056,6 +1073,7 @@ def on_photo_or_document(message):
                              reply_markup=main_menu_kb())
                 return
 
+    # === Улучшение ===
     if step == "waiting_enhance_photo":
         photo_bytes = get_photo_bytes(message)
         if not photo_bytes:
@@ -1071,6 +1089,7 @@ def on_photo_or_document(message):
         bot.delete_message(message.chat.id, msg.message_id)
         return
 
+    # === Фото для поста (ручной режим) ===
     if step == "waiting_post_photo":
         photo_bytes = get_photo_bytes(message)
         if not photo_bytes:
@@ -1086,6 +1105,7 @@ def on_photo_or_document(message):
         bot.reply_to(message, "📸 Фото сохранено!\n\nОтправь <b>ЗАГОЛОВОК</b>:", parse_mode="HTML")
         return
 
+    # === Фото для сторис ===
     if step == "waiting_story_photo":
         photo_bytes = get_photo_bytes(message)
         if not photo_bytes:
@@ -1124,7 +1144,8 @@ def on_text(message):
     if text == BTN_ENHANCE:
         cmd_enhance(message); return
 
-    if forwarded and step in ("idle", "waiting_post_action", None):
+    # === АВТО-ПРИЁМ текстового репоста — из любого финального состояния ===
+    if forwarded and step in AUTO_STEPS:
         title, body = split_title_and_body(text)
         user_state[uid] = {
             "step": "waiting_repost_photo",
