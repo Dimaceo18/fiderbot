@@ -12,8 +12,7 @@ import atexit
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from io import BytesIO
-from typing import List, Dict, Optional, Tuple
-from collections import defaultdict
+from typing import Dict, Optional, Tuple
 
 import requests
 import telebot
@@ -130,7 +129,7 @@ if DEEPSEEK_API_KEY and OPENAI_AVAILABLE:
 
 
 # =========================
-# AI (deepseek-v4-flash — актуальная модель)
+# AI (исправлено: max_tokens 1500, проверка finish_reason)
 # =========================
 AI_NEWS_PROMPT = """Ты — редактор новостной ленты. Преобразуй присланный текст в новость в одну строку по правилам:
 
@@ -150,19 +149,24 @@ def adapt_news_with_ai(text: str) -> Optional[str]:
         return None
     try:
         response = deepseek_client.chat.completions.create(
-            model="deepseek-v4-flash",  # актуальная модель, deepseek-chat/flash устарели
+            model="deepseek-v4-flash",
             messages=[
                 {"role": "system", "content": AI_NEWS_PROMPT},
                 {"role": "user", "content": text}
             ],
             temperature=0.3,
-            max_tokens=300,
+            max_tokens=1500,  # ← увеличено с 300
             stream=False
         )
-        msg = response.choices[0].message
+        choice = response.choices[0]
+        # Проверяем, не обрезан ли ответ
+        if choice.finish_reason == "length":
+            logger.error("DeepSeek ответ обрезан: не хватило max_tokens (finish_reason=length)")
+            return None
+        msg = choice.message
         content = getattr(msg, "content", None)
         if not content:
-            logger.error(f"DeepSeek returned empty content: {response}")
+            logger.error(f"DeepSeek returned empty content: finish_reason={choice.finish_reason}")
             return None
         result = content.strip().strip('"').strip("'").strip()
         if len(result) > 250:
@@ -224,12 +228,38 @@ def tg_file_bytes(file_id: str) -> bytes:
     return r.content
 
 
+def clean_markdown(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"\*\*(.+?)\*\*", r"\1", s)
+    s = re.sub(r"__(.+?)__", r"\1", s)
+    s = re.sub(r"\*(.+?)\*", r"\1", s)
+    s = re.sub(r"_(.+?)_", r"\1", s)
+    s = re.sub(r"`(.+?)`", r"\1", s)
+    s = re.sub(r"^#+\s*", "", s)
+    s = re.sub(r"^>\s*", "", s)
+    return s.strip()
+
+
 def split_title_and_body(text: str) -> Tuple[str, str]:
+    """
+    Заголовок = первая непустая строка. Без ограничения длины.
+    Тело = всё остальное.
+    """
     text = (text or "").strip()
     if not text:
         return "", ""
-    parts = text.split("\n", 1)
-    return parts[0].strip(), (parts[1].strip() if len(parts) > 1 else "")
+
+    lines = text.split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+
+    if not lines:
+        return "", ""
+
+    title = clean_markdown(lines[0].strip())
+    body = "\n".join(lines[1:]).strip()
+    return title, body
 
 
 def is_forwarded(message) -> bool:
@@ -721,7 +751,7 @@ def on_action(call):
             return
         adapted = adapt_news_with_ai(original)
         if not adapted:
-            bot.send_message(call.message.chat.id, "❌ Не удалось адаптировать. Проверь логи (DeepSeek API error).")
+            bot.send_message(call.message.chat.id, "❌ Не удалось адаптировать. Проверь логи (DeepSeek API error / finish_reason=length).")
             return
         st["adapted_text"] = adapted
         st["ai_choice"] = "adapted"
@@ -733,29 +763,66 @@ def on_action(call):
         )
         return
 
+    # === ВЫБОР ФОРМАТА: ПОСТ ===
     if call.data == "format_post":
         bot.answer_callback_query(call.id, "📝 Пост")
         if st.get("ai_choice") == "adapted":
             st["title"] = st["adapted_text"]
             st["body_raw"] = ""
+        else:
+            title = (st.get("title") or "").strip()
+            body = (st.get("body_raw") or "").strip()
+            if not title and body:
+                parts = body.split("\n", 1)
+                title = parts[0].strip()
+                body = parts[1].strip() if len(parts) > 1 else ""
+            st["title"] = clean_markdown(title)
+            st["body_raw"] = body
         st["step"] = "waiting_post_highlight"
         user_state[uid] = st
-        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
-                              text="💜 Пришли <b>ФРАЗУ</b> для выделения (или «нет»):", parse_mode="HTML")
+        preview = html.escape((st.get("title") or "")[:100])
+        bot.edit_message_text(
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            text=f"📝 <b>Заголовок на фото:</b>\n<i>{preview}</i>\n\n"
+                 "💜 Пришли <b>ФРАЗУ</b> для выделения (или «нет»):",
+            parse_mode="HTML"
+        )
         return
 
+    # === ВЫБОР ФОРМАТА: СТОРИС ===
     if call.data == "format_story":
         bot.answer_callback_query(call.id, "📱 Сторис")
         if st.get("ai_choice") == "adapted":
             st["news_text"] = st["adapted_text"]
         else:
-            st["news_text"] = st.get("body_raw") or st.get("title", "")
+            # ЖЁСТКО: берём первую строку оригинала
+            raw = (st.get("body_raw") or "").strip()
+            title = (st.get("title") or "").strip()
+
+            first_line = ""
+            if title:
+                first_line = title
+            elif raw:
+                for line in raw.split("\n"):
+                    if line.strip():
+                        first_line = line.strip()
+                        break
+            st["news_text"] = clean_markdown(first_line)
+
+            logger.info(f"STORY first_line='{st['news_text'][:80]}' "
+                        f"(title_len={len(title)}, body_len={len(raw)})")
         st["step"] = "waiting_news_highlight"
         user_state[uid] = st
-        bot.edit_message_text(chat_id=call.message.chat.id, message_id=call.message.message_id,
-                              text="💜 Пришли <b>ФРАЗУ</b> для выделения (или «нет»):", parse_mode="HTML")
+        preview = html.escape((st.get("news_text") or "")[:150])
+        bot.edit_message_text(
+            chat_id=call.message.chat.id, message_id=call.message.message_id,
+            text=f"📱 <b>Новость для сторис (первая строка):</b>\n<i>{preview}</i>\n\n"
+                 "💜 Пришли <b>ФРАЗУ</b> для выделения (или «нет»):",
+            parse_mode="HTML"
+        )
         return
 
+    # === Редактирование поста ===
     if call.data == "edit_post_body":
         st["step"] = "waiting_post_body"; user_state[uid] = st
         bot.answer_callback_query(call.id, "Ок")
@@ -853,7 +920,7 @@ def cmd_start(message):
         message.chat.id,
         "👋 <b>Feeder Bot</b>\n\n"
         "• Оформление постов и сторис\n"
-        "• Адаптация текста через ИИ (deepseek-v4-flash)\n"
+        "• Адаптация текста через ИИ\n"
         "• Улучшение фото\n\n"
         "🚀 Перешли пост из канала или отправь фото с текстом.",
         parse_mode="HTML", reply_markup=main_menu_kb()
@@ -897,7 +964,7 @@ def h_enhance(m): cmd_enhance(m)
 
 
 # =========================
-# Media groups (альбомы)
+# Media groups
 # =========================
 def _process_media_group(gid: str):
     time.sleep(1.5)
@@ -926,7 +993,7 @@ def _process_media_group(gid: str):
 
 
 # =========================
-# Photo/document handler
+# Photo handler
 # =========================
 @bot.message_handler(content_types=["photo", "document"])
 def on_photo_or_document(message):
@@ -939,7 +1006,6 @@ def on_photo_or_document(message):
     logger.info(f"PHOTO uid={uid} step={step} fwd={forwarded} "
                 f"caption_len={len(caption_text)} mgid={message.media_group_id}")
 
-    # === Медиа-группа (альбом) ===
     if message.media_group_id:
         gid = message.media_group_id
         with media_group_lock:
@@ -957,7 +1023,6 @@ def on_photo_or_document(message):
             t.start()
         return
 
-    # === Досылка фото к репосту без фото ===
     if step == "waiting_repost_photo":
         photo_bytes = get_photo_bytes(message)
         if not photo_bytes:
@@ -971,7 +1036,6 @@ def on_photo_or_document(message):
                        photo_bytes, reply_to_msg=message)
         return
 
-    # === Авто-приём: фото + текст, либо репост с фото ===
     if step in ("idle", "waiting_post_photo", None):
         if caption_text:
             photo_bytes = get_photo_bytes(message)
@@ -992,7 +1056,6 @@ def on_photo_or_document(message):
                              reply_markup=main_menu_kb())
                 return
 
-    # === Улучшение ===
     if step == "waiting_enhance_photo":
         photo_bytes = get_photo_bytes(message)
         if not photo_bytes:
@@ -1008,7 +1071,6 @@ def on_photo_or_document(message):
         bot.delete_message(message.chat.id, msg.message_id)
         return
 
-    # === Фото для поста (ручной режим) ===
     if step == "waiting_post_photo":
         photo_bytes = get_photo_bytes(message)
         if not photo_bytes:
@@ -1024,7 +1086,6 @@ def on_photo_or_document(message):
         bot.reply_to(message, "📸 Фото сохранено!\n\nОтправь <b>ЗАГОЛОВОК</b>:", parse_mode="HTML")
         return
 
-    # === Фото для сторис ===
     if step == "waiting_story_photo":
         photo_bytes = get_photo_bytes(message)
         if not photo_bytes:
@@ -1063,7 +1124,6 @@ def on_text(message):
     if text == BTN_ENHANCE:
         cmd_enhance(message); return
 
-    # === Репост текста без фото ===
     if forwarded and step in ("idle", "waiting_post_action", None):
         title, body = split_title_and_body(text)
         user_state[uid] = {
@@ -1079,17 +1139,16 @@ def on_text(message):
         )
         return
 
-    # === Пост: заголовок ===
     if step == "waiting_post_title":
         if not text:
             bot.reply_to(message, "❌ Пустой заголовок."); return
-        st["title"] = text
+        st["title"] = clean_markdown(text)
         st["step"] = "waiting_post_highlight"
         user_state[uid] = st
-        bot.reply_to(message, f"✅ Заголовок: <b>{html.escape(text)}</b>\n\n💜 Пришли <b>ФРАЗУ</b>:", parse_mode="HTML")
+        bot.reply_to(message, f"✅ Заголовок: <b>{html.escape(st['title'])}</b>\n\n💜 Пришли <b>ФРАЗУ</b>:",
+                     parse_mode="HTML")
         return
 
-    # === Пост: плашка ===
     if step == "waiting_post_highlight":
         if not text:
             bot.reply_to(message, "❌ Пустая фраза."); return
@@ -1115,7 +1174,6 @@ def on_text(message):
         bot.reply_to(message, "✅ Фраза сохранена!\n\nОтправь <b>ОСНОВНОЙ ТЕКСТ</b>:", parse_mode="HTML")
         return
 
-    # === Пост: тело ===
     if step == "waiting_post_body":
         if not text:
             bot.reply_to(message, "❌ Пустой текст."); return
@@ -1135,7 +1193,6 @@ def on_text(message):
             bot.reply_to(message, f"❌ Ошибка: {e}")
         return
 
-    # === Сторис-новость: плашка ===
     if step == "waiting_news_highlight":
         if not text:
             bot.reply_to(message, "❌ Пустая фраза."); return
@@ -1154,7 +1211,6 @@ def on_text(message):
             bot.reply_to(message, f"❌ Ошибка: {e}")
         return
 
-    # === Сторис-новость: текст ===
     if step == "waiting_news_text":
         if not text:
             bot.reply_to(message, "❌ Пустой текст."); return
@@ -1174,17 +1230,15 @@ def on_text(message):
             bot.reply_to(message, f"❌ Ошибка: {e}")
         return
 
-    # === Сторис: заголовок ===
     if step == "waiting_story_title":
         if not text:
             bot.reply_to(message, "❌ Пустой заголовок."); return
-        st["title"] = text
+        st["title"] = clean_markdown(text)
         st["step"] = "waiting_story_body"
         user_state[uid] = st
-        bot.reply_to(message, f"✅ Заголовок: <b>{html.escape(text)}</b>\n\nОтправь <b>ТЕКСТ</b>:", parse_mode="HTML")
+        bot.reply_to(message, f"✅ Заголовок: <b>{html.escape(st['title'])}</b>\n\nОтправь <b>ТЕКСТ</b>:", parse_mode="HTML")
         return
 
-    # === Сторис: тело ===
     if step == "waiting_story_body":
         if not text:
             bot.reply_to(message, "❌ Пустой текст."); return
