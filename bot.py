@@ -13,7 +13,6 @@ import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from io import BytesIO
 from typing import List, Dict, Optional, Tuple
-from urllib.parse import urlparse
 from collections import defaultdict
 
 import requests
@@ -88,7 +87,6 @@ if not OPENAI_AVAILABLE:
     logger.warning("openai package is not installed. AI adaptation will not work.")
 
 MAX_FILE_SIZE = 20 * 1024 * 1024
-REQUEST_TIMEOUT = 15
 FDR_POST_PURPLE_COLOR = (122, 58, 240)
 FDR_STORY_W = 720
 FDR_STORY_H = 1280
@@ -123,8 +121,6 @@ SESSION.headers.update({
 })
 
 user_state: Dict[int, Dict] = {}
-
-# Временное хранилище для медиа-групп
 media_groups: Dict[str, Dict] = {}
 media_group_lock = threading.Lock()
 
@@ -134,7 +130,7 @@ if DEEPSEEK_API_KEY and OPENAI_AVAILABLE:
 
 
 # =========================
-# AI
+# AI (deepseek-v4-flash — актуальная модель)
 # =========================
 AI_NEWS_PROMPT = """Ты — редактор новостной ленты. Преобразуй присланный текст в новость в одну строку по правилам:
 
@@ -150,10 +146,11 @@ AI_NEWS_PROMPT = """Ты — редактор новостной ленты. П�
 
 def adapt_news_with_ai(text: str) -> Optional[str]:
     if not deepseek_client:
+        logger.error("DeepSeek client is not initialized")
         return None
     try:
         response = deepseek_client.chat.completions.create(
-            model="deepseek-flash",
+            model="deepseek-v4-flash",  # актуальная модель, deepseek-chat/flash устарели
             messages=[
                 {"role": "system", "content": AI_NEWS_PROMPT},
                 {"role": "user", "content": text}
@@ -162,12 +159,18 @@ def adapt_news_with_ai(text: str) -> Optional[str]:
             max_tokens=300,
             stream=False
         )
-        result = response.choices[0].message.content.strip().strip('"').strip("'")
+        msg = response.choices[0].message
+        content = getattr(msg, "content", None)
+        if not content:
+            logger.error(f"DeepSeek returned empty content: {response}")
+            return None
+        result = content.strip().strip('"').strip("'").strip()
         if len(result) > 250:
             result = result[:247] + "..."
+        logger.info(f"AI adapted: len={len(result)}")
         return result
     except Exception as e:
-        logger.error(f"DeepSeek API error: {e}")
+        logger.error(f"DeepSeek API error: {type(e).__name__}: {e}")
         return None
 
 
@@ -238,12 +241,10 @@ def is_forwarded(message) -> bool:
 
 
 def get_message_text(message) -> str:
-    """Достаёт текст из всех возможных мест, включая forward_origin."""
     if getattr(message, "caption", None):
         return message.caption.strip()
     if getattr(message, "text", None):
         return message.text.strip()
-    # fallback: текст в forward_origin (редкий edge case)
     fwd = getattr(message, "forward_origin", None)
     if fwd is not None:
         try:
@@ -720,7 +721,7 @@ def on_action(call):
             return
         adapted = adapt_news_with_ai(original)
         if not adapted:
-            bot.send_message(call.message.chat.id, "❌ Не удалось адаптировать.")
+            bot.send_message(call.message.chat.id, "❌ Не удалось адаптировать. Проверь логи (DeepSeek API error).")
             return
         st["adapted_text"] = adapted
         st["ai_choice"] = "adapted"
@@ -852,7 +853,7 @@ def cmd_start(message):
         message.chat.id,
         "👋 <b>Feeder Bot</b>\n\n"
         "• Оформление постов и сторис\n"
-        "• Адаптация текста через ИИ\n"
+        "• Адаптация текста через ИИ (deepseek-v4-flash)\n"
         "• Улучшение фото\n\n"
         "🚀 Перешли пост из канала или отправь фото с текстом.",
         parse_mode="HTML", reply_markup=main_menu_kb()
@@ -896,11 +897,10 @@ def h_enhance(m): cmd_enhance(m)
 
 
 # =========================
-# Обработка медиа-групп (альбомов)
+# Media groups (альбомы)
 # =========================
 def _process_media_group(gid: str):
-    """Вызывается через таймер, когда все сообщения группы собраны."""
-    time.sleep(1.5)  # ждём все сообщения группы
+    time.sleep(1.5)
     with media_group_lock:
         group = media_groups.pop(gid, None)
     if not group:
@@ -908,14 +908,12 @@ def _process_media_group(gid: str):
     msgs = group["messages"]
     if not msgs:
         return
-    # Берём текст из любого сообщения группы
     text = ""
     for m in msgs:
         t = get_message_text(m)
         if t:
             text = t
             break
-    # Берём первое фото
     first = msgs[0]
     photo_bytes = get_photo_bytes(first)
     if not photo_bytes:
@@ -928,7 +926,7 @@ def _process_media_group(gid: str):
 
 
 # =========================
-# Фото/документы
+# Photo/document handler
 # =========================
 @bot.message_handler(content_types=["photo", "document"])
 def on_photo_or_document(message):
@@ -948,7 +946,6 @@ def on_photo_or_document(message):
             if gid not in media_groups:
                 media_groups[gid] = {"messages": [], "timer": None}
             media_groups[gid]["messages"].append(message)
-            # Отменяем старый таймер и ставим новый
             if media_groups[gid]["timer"] is not None:
                 try:
                     media_groups[gid]["timer"].cancel()
@@ -1047,7 +1044,7 @@ def on_photo_or_document(message):
 
 
 # =========================
-# Текстовые сообщения
+# Text handler
 # =========================
 @bot.message_handler(content_types=["text"])
 def on_text(message):
@@ -1210,7 +1207,7 @@ def on_text(message):
 
 
 # =========================
-# Channel post handler (посты из каналов)
+# Channel post handler
 # =========================
 @bot.channel_post_handler(content_types=["photo", "document", "text"])
 def on_channel_post(message):
@@ -1224,7 +1221,6 @@ def on_channel_post(message):
         return
 
     chat_id = message.chat.id
-    # Для каналов from_user может быть None — используем chat.id как uid
     uid = message.from_user.id if message.from_user else chat_id
 
     if photo_bytes:
