@@ -33,7 +33,7 @@ except ImportError:
     OpenAI = None
 
 # =========================
-# Single instance lock
+# Single instance lock (работает только в пределах одного контейнера/host)
 # =========================
 lock_file = '/tmp/feeder_bot_instance.lock'
 
@@ -55,7 +55,7 @@ def check_single_instance():
         return False
 
 if not check_single_instance():
-    print("Another instance is already running. Exiting.")
+    print("Another instance is already running on this host. Exiting.")
     sys.exit(1)
 
 
@@ -281,7 +281,7 @@ def strip_leading_emoji(s: str) -> str:
 
 
 def split_title_and_body(text: str) -> Tuple[str, str]:
-    """Заголовок = первая непустая строка. Без ограничения длины. Ведущие эмодзи срезаются."""
+    """Заголовок = первая непустая строка. Ведущие эмодзи срезаются."""
     text = (text or "").strip()
     if not text:
         return "", ""
@@ -615,7 +615,7 @@ def make_fdr_story_card(photo_bytes: bytes, title: str, body_text: str, border: 
     draw.rectangle([0, photo_h+header_h, FDR_STORY_W, FDR_STORY_H], fill=(0, 0, 0))
     pad = 34
     h_box = (pad, photo_h+pad, FDR_STORY_W-pad, photo_h+header_h-pad)
-    # Текст приподнят ближе к фото (было photo_h+header_h+pad)
+    # Текст приподнят ближе к фото
     bottom_reserve = (STORY_LINK_BOX_BOTTOM_MARGIN + STORY_LINK_BOX_H + 20) if border else pad
     b_box = (pad, photo_h + header_h + int(pad * 0.4),
              FDR_STORY_W - pad, FDR_STORY_H - bottom_reserve)
@@ -649,7 +649,7 @@ def make_news_story_card(photo_bytes: bytes, news_text: str, highlight_phrase: s
         return r.crop((l, t, l+tw, t+th))
 
     canvas.paste(fit_cover(photo, photo_size, photo_size), ((FDR_STORY_W-photo_size)//2, photo_top))
-    # Текст приподнят ближе к фото (было + 60)
+    # Текст приподнят ближе к фото
     news_top = photo_top + photo_size + 30
     bottom_reserve = (STORY_LINK_BOX_BOTTOM_MARGIN + STORY_LINK_BOX_H + 20) if border else 80
     news_box = (50, news_top, FDR_STORY_W-50, FDR_STORY_H - bottom_reserve)
@@ -1171,7 +1171,7 @@ def on_photo_or_document(message):
                        photo_bytes, reply_to_msg=message)
         return
 
-    # === АВТО-ПРИЁМ РЕПОСТА / ПОСТА с текстом — из любого финального состояния ===
+    # === АВТО-ПРИЁМ РЕПОСТА / ПОСТА с текстом ===
     if step in AUTO_STEPS:
         if caption_text:
             photo_bytes = get_photo_bytes(message)
@@ -1263,7 +1263,7 @@ def on_text(message):
     if text == BTN_ENHANCE:
         cmd_enhance(message); return
 
-    # === АВТО-ПРИЁМ текстового репоста — из любого финального состояния ===
+    # === АВТО-ПРИЁМ текстового репоста ===
     if forwarded and step in AUTO_STEPS:
         title, body = split_title_and_body(text)
         user_state[uid] = {
@@ -1449,7 +1449,11 @@ def prepare_telegram_before_polling():
         logger.warning(f"delete_webhook failed: {e}")
 
 
-def wait_for_other_instance(max_wait_sec: int = 90):
+def wait_for_other_instance(max_wait_sec: int = 90) -> bool:
+    """
+    Ждём, пока освободится токен (другой экземпляр может завершаться).
+    Возвращает True, если токен свободен, False — если так и не освободился.
+    """
     deadline = time.time() + max_wait_sec
     delay = 5
     while time.time() < deadline:
@@ -1474,7 +1478,11 @@ def wait_for_other_instance(max_wait_sec: int = 90):
 
 
 def start_polling_with_retry():
-    max_retries = 30
+    """
+    409 Conflict = токен занят другим процессом. Ретраить бессмысленно — выходим.
+    Прочие ошибки — ретраим с экспоненциальной задержкой.
+    """
+    max_retries = 10
     delay = 5
     attempt = 0
     while attempt < max_retries:
@@ -1486,17 +1494,18 @@ def start_polling_with_retry():
             return
         except ApiTelegramException as e:
             if e.error_code == 409:
-                logger.warning(f"409: retry {delay}s ({attempt}/{max_retries})")
-                time.sleep(delay)
-                delay = min(delay * 2, 120)
-            else:
-                logger.error(f"Telegram error: {e}")
-                time.sleep(delay)
-                delay = min(delay * 2, 120)
+                logger.error(
+                    f"409 Conflict: другой экземпляр бота работает на этом токене. "
+                    f"Останавливаюсь (попытка {attempt}/{max_retries})."
+                )
+                sys.exit(2)
+            logger.error(f"Telegram error: {e}")
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
         except Exception as e:
             logger.error(f"Polling error: {e}")
             time.sleep(delay)
-            delay = min(delay * 2, 120)
+            delay = min(delay * 2, 60)
     logger.error("Max retries, exit")
     sys.exit(1)
 
@@ -1512,7 +1521,14 @@ if __name__ == "__main__":
         threading.Thread(target=run_http_server, daemon=True).start()
         logger.info("🌐 Health check started")
         prepare_telegram_before_polling()
-        wait_for_other_instance(max_wait_sec=90)
+
+        if not wait_for_other_instance(max_wait_sec=90):
+            logger.error(
+                "❌ Другой экземпляр бота всё ещё работает на этом токене. "
+                "Остановите его (проверьте деплои/ps/docker) и перезапустите сервис."
+            )
+            sys.exit(2)
+
         logger.info("🤖 Bot polling...")
         start_polling_with_retry()
     except Exception as e:
