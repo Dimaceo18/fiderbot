@@ -227,15 +227,6 @@ def ensure_fonts():
         raise RuntimeError(f"Font not found: {FONT_MAIN}")
 
 
-def warn_if_too_small(chat_id, photo_bytes: bytes):
-    try:
-        im = Image.open(BytesIO(photo_bytes))
-        if im.width < 900 or im.height < 1100:
-            bot.send_message(chat_id, "⚠️ Фото маленького разрешения. Лучше от 1080×1350.")
-    except:
-        pass
-
-
 def tg_file_bytes(file_id: str) -> bytes:
     file_info = bot.get_file(file_id)
     file_url = f"https://api.telegram.org/file/bot{TOKEN}/{file_info.file_path}"
@@ -403,32 +394,34 @@ def wrap_no_truncate(draw, text, font, max_width, max_lines=6):
 
 def fit_text_block(draw, text, font_path, safe_w, max_block_h, max_lines=6,
                    start_size=90, min_size=16, line_spacing_ratio=0.22):
+    """Подбирает размер шрифта. Высота всех строк одинаковая — эталон 'AgЙ'."""
     text = (text or "").strip().upper() or " "
     size = start_size
     while size >= min_size:
         font = ImageFont.truetype(font_path, size)
         lines, ok = wrap_no_truncate(draw, text, font, safe_w, max_lines=max_lines)
         spacing = int(size * line_spacing_ratio)
-        heights, total_h, max_w = [], 0, 0
-        for ln in lines:
-            bb = draw.textbbox((0, 0), ln, font=font)
-            lw, lh = bb[2] - bb[0], bb[3] - bb[1]
-            heights.append(lh)
-            total_h += lh
-            max_w = max(max_w, lw)
+
+        # Единая высота строки для всех строк — по эталону с макс. охватом
+        ref_bb = draw.textbbox((0, 0), "AgЙ", font=font)
+        line_h = ref_bb[3] - ref_bb[1]
+
+        heights = [line_h] * len(lines)
+        total_h = line_h * len(lines)
+        max_w = max(text_width(draw, ln, font) for ln in lines)
+
         total_h += spacing * (len(lines) - 1)
         if ok and max_w <= safe_w and total_h <= max_block_h:
             return font, lines, heights, spacing, total_h
         size -= 2
+
     font = ImageFont.truetype(font_path, min_size)
     lines, _ = wrap_no_truncate(draw, text, font, safe_w, max_lines=max_lines)
     spacing = int(min_size * line_spacing_ratio)
-    heights, total_h = [], 0
-    for ln in lines:
-        bb = draw.textbbox((0, 0), ln, font=font)
-        heights.append(bb[3] - bb[1])
-        total_h += bb[3] - bb[1]
-    total_h += spacing * (len(lines) - 1)
+    ref_bb = draw.textbbox((0, 0), "AgЙ", font=font)
+    line_h = ref_bb[3] - ref_bb[1]
+    heights = [line_h] * len(lines)
+    total_h = line_h * len(lines) + spacing * (len(lines) - 1)
     return font, lines, heights, spacing, total_h
 
 
@@ -552,6 +545,7 @@ def make_fdr_post_card(photo_bytes: bytes, title_text: str, highlight_phrase: st
     img = ImageEnhance.Brightness(img).enhance(0.85)
     img = apply_bottom_gradient(img, height_pct=CHP_GRADIENT_PCT, max_alpha=220)
     draw = ImageDraw.Draw(img)
+
     margin_x = int(img.width * 0.06)
     margin_bottom = int(img.height * 0.08)
     safe_w = img.width - 2 * margin_x
@@ -559,36 +553,47 @@ def make_fdr_post_card(photo_bytes: bytes, title_text: str, highlight_phrase: st
     hl_upper = highlight_phrase.strip().upper()
     hl_words = set(hl_upper.split())
     title_max_h = int(img.height * 0.23)
+
     font, lines, heights, spacing, total_h = fit_text_block(
         draw, title_upper, FONT_MAIN, safe_w, title_max_h,
         max_lines=6, start_size=int(img.height * 0.11), min_size=16
     )
+
+    # Все строки одной высоты — берём эталон по "AgЙ" (есть верх и низ)
+    ref_bb = draw.textbbox((0, 0), "AgЙ", font=font)
+    line_h = ref_bb[3] - ref_bb[1]
+    # Смещение базовой линии внутри line_h, чтобы все строки выровнены
+    base_offset = -ref_bb[1]
+
     base_y = img.height - margin_bottom - total_h
+
+    # 1) рисуем плашки (подсветку) под нужными словами
     y = base_y
-    for i, line in enumerate(lines):
+    for line in lines:
         words = line.split()
         cx = margin_x
         for w in words:
-            bb = draw.textbbox((cx, y), w, font=font)
+            w_w = text_width(draw, w, font)
             if w in hl_words:
+                bb = draw.textbbox((cx, y + base_offset), w, font=font)
                 pad = 10
-                draw.rectangle([bb[0]-pad, bb[1]-pad, bb[2]+pad, bb[3]+pad], fill=FDR_POST_PURPLE_COLOR)
-            if w != words[-1]:
-                cx += text_width(draw, w, font) + text_width(draw, " ", font)
-            else:
-                cx += text_width(draw, w, font)
-        y += heights[i] + spacing
+                draw.rectangle([bb[0]-pad, bb[1]-pad, bb[2]+pad, bb[3]+pad],
+                               fill=FDR_POST_PURPLE_COLOR)
+            cx += w_w + (text_width(draw, " ", font) if w != words[-1] else 0)
+        y += line_h + spacing
+
+    # 2) рисуем текст поверх плашек
     y = base_y
-    for i, line in enumerate(lines):
+    for line in lines:
         words = line.split()
         cx = margin_x
         for w in words:
-            draw.text((cx, y), w, font=font, fill="white")
+            draw.text((cx, y + base_offset), w, font=font, fill="white")
+            cx += text_width(draw, w, font)
             if w != words[-1]:
-                cx += text_width(draw, w, font) + text_width(draw, " ", font)
-            else:
-                cx += text_width(draw, w, font)
-        y += heights[i] + spacing
+                cx += text_width(draw, " ", font)
+        y += line_h + spacing
+
     out = BytesIO()
     img.save(out, format="JPEG", quality=95, subsampling=0, optimize=True)
     out.seek(0)
@@ -1166,7 +1171,6 @@ def on_photo_or_document(message):
         if not check_file_size(photo_bytes):
             bot.reply_to(message, "❌ Файл > 20MB.")
             return
-        warn_if_too_small(message.chat.id, photo_bytes)
         show_ai_choice(message.chat.id, uid, st.get("title", ""), st.get("body_raw", ""),
                        photo_bytes, reply_to_msg=message)
         return
@@ -1182,7 +1186,6 @@ def on_photo_or_document(message):
             if not check_file_size(photo_bytes):
                 bot.reply_to(message, "❌ Файл > 20MB.")
                 return
-            warn_if_too_small(message.chat.id, photo_bytes)
             title, body = split_title_and_body(caption_text)
             show_ai_choice(message.chat.id, uid, title, body, photo_bytes, reply_to_msg=message)
             return
@@ -1217,7 +1220,6 @@ def on_photo_or_document(message):
         if not check_file_size(photo_bytes):
             bot.reply_to(message, "❌ Файл > 20MB.")
             return
-        warn_if_too_small(message.chat.id, photo_bytes)
         st["photo_bytes"] = photo_bytes
         st["step"] = "waiting_post_title"
         user_state[uid] = st
@@ -1233,7 +1235,6 @@ def on_photo_or_document(message):
         if not check_file_size(photo_bytes):
             bot.reply_to(message, "❌ Файл > 20MB.")
             return
-        warn_if_too_small(message.chat.id, photo_bytes)
         st["photo_bytes"] = photo_bytes
         st["step"] = "waiting_story_title"
         user_state[uid] = st
@@ -1450,10 +1451,7 @@ def prepare_telegram_before_polling():
 
 
 def wait_for_other_instance(max_wait_sec: int = 90) -> bool:
-    """
-    Ждём, пока освободится токен (другой экземпляр может завершаться).
-    Возвращает True, если токен свободен, False — если так и не освободился.
-    """
+    """Ждём, пока освободится токен. True — свободен, False — так и не освободился."""
     deadline = time.time() + max_wait_sec
     delay = 5
     while time.time() < deadline:
@@ -1478,10 +1476,7 @@ def wait_for_other_instance(max_wait_sec: int = 90) -> bool:
 
 
 def start_polling_with_retry():
-    """
-    409 Conflict = токен занят другим процессом. Ретраить бессмысленно — выходим.
-    Прочие ошибки — ретраим с экспоненциальной задержкой.
-    """
+    """409 — токен занят, ретраить бессмысленно, выходим. Прочее — ретраим."""
     max_retries = 10
     delay = 5
     attempt = 0
