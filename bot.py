@@ -93,6 +93,13 @@ FONT_MAIN = "Inter-Black.ttf"
 TARGET_W, TARGET_H = 750, 938
 CHP_GRADIENT_PCT = 0.48
 
+# Параметры прямоугольной обводки под ссылку в сторис
+STORY_LINK_BOX_W = 560
+STORY_LINK_BOX_H = 120
+STORY_LINK_BOX_BOTTOM_MARGIN = 40
+STORY_LINK_BOX_BORDER_W = 4
+STORY_LINK_BOX_RADIUS = 18
+
 # =========================
 # UI
 # =========================
@@ -148,7 +155,7 @@ AI_NEWS_PROMPT = """Ты — редактор новостной ленты. П�
 Стиль — нейтральный, информационный, без оценок, эмоций и воды.
 Структура — одно предложение (допустимы точка с запятой и тире внутри).
 Главное — вынеси в начало самое важное (что произошло), затем уточнения.
-Не выдумывай факты, которых нет в тексте; числа, имена и даты — точно как в источнике.
+Не выдумывай фактов, которых нет в тексте; числа, имена и даты — точно как в источнике.
 Если в тексте есть чувствительная тема (ЧП, суицид, трагедия) — без лишних подробностей и с корректными формулировками.
 Выведи только одну строку новости, без пояснений и заголовков."""
 
@@ -250,8 +257,31 @@ def clean_markdown(s: str) -> str:
     return s.strip()
 
 
+# Регэксп для срезания ведущих эмодзи / пиктограмм / флагов / селекторов
+EMOJI_LEAD_RE = re.compile(
+    "^["
+    "\U0001F000-\U0001FAFF"   # emoji & symbols
+    "\U00002600-\U000027BF"   # misc symbols & dingbats
+    "\U0001F1E6-\U0001F1FF"   # flags
+    "\U00002190-\U000021FF"   # arrows
+    "\U00002B00-\U00002BFF"   # misc symbols and arrows
+    "\U0000FE00-\U0000FE0F"   # variation selectors
+    "\U0001F3FB-\U0001F3FF"   # skin tones
+    "\U0000200D"              # ZWJ
+    "\U000020E3"              # combining enclosing keycap
+    "]+"
+)
+
+def strip_leading_emoji(s: str) -> str:
+    """Срезает ведущие эмодзи/пиктограммы в начале строки, не трогая остальной текст."""
+    if not s:
+        return s
+    s2 = EMOJI_LEAD_RE.sub("", s).lstrip()
+    return s2 if s2 else s
+
+
 def split_title_and_body(text: str) -> Tuple[str, str]:
-    """Заголовок = первая непустая строка. Без ограничения длины."""
+    """Заголовок = первая непустая строка. Без ограничения длины. Ведущие эмодзи срезаются."""
     text = (text or "").strip()
     if not text:
         return "", ""
@@ -260,7 +290,7 @@ def split_title_and_body(text: str) -> Tuple[str, str]:
         lines.pop(0)
     if not lines:
         return "", ""
-    title = clean_markdown(lines[0].strip())
+    title = clean_markdown(strip_leading_emoji(lines[0].strip()))
     body = "\n".join(lines[1:]).strip()
     return title, body
 
@@ -494,6 +524,23 @@ def _draw_story_text(draw, text, box, font, fill=(255, 255, 255), align="center"
         y += line_h + line_gap
 
 
+def draw_link_border(canvas: Image.Image) -> Image.Image:
+    """Фиолетовая прямоугольная обводка внизу — под ручную вставку ссылки."""
+    draw = ImageDraw.Draw(canvas)
+    W, H = canvas.size
+    bw, bh = STORY_LINK_BOX_W, STORY_LINK_BOX_H
+    x1 = (W - bw) // 2
+    y1 = H - STORY_LINK_BOX_BOTTOM_MARGIN - bh
+    x2, y2 = x1 + bw, y1 + bh
+    draw.rounded_rectangle(
+        [x1, y1, x2, y2],
+        radius=STORY_LINK_BOX_RADIUS,
+        outline=FDR_POST_PURPLE_COLOR,
+        width=STORY_LINK_BOX_BORDER_W,
+    )
+    return canvas
+
+
 # =========================
 # Cards
 # =========================
@@ -508,7 +555,7 @@ def make_fdr_post_card(photo_bytes: bytes, title_text: str, highlight_phrase: st
     margin_x = int(img.width * 0.06)
     margin_bottom = int(img.height * 0.08)
     safe_w = img.width - 2 * margin_x
-    title_upper = title_text.strip().upper()
+    title_upper = strip_leading_emoji(title_text.strip()).upper()
     hl_upper = highlight_phrase.strip().upper()
     hl_words = set(hl_upper.split())
     title_max_h = int(img.height * 0.23)
@@ -548,7 +595,7 @@ def make_fdr_post_card(photo_bytes: bytes, title_text: str, highlight_phrase: st
     return out
 
 
-def make_fdr_story_card(photo_bytes: bytes, title: str, body_text: str) -> BytesIO:
+def make_fdr_story_card(photo_bytes: bytes, title: str, body_text: str, border: bool = False) -> BytesIO:
     ensure_fonts()
     canvas = Image.new("RGB", (FDR_STORY_W, FDR_STORY_H), (0, 0, 0))
     draw = ImageDraw.Draw(canvas)
@@ -568,18 +615,25 @@ def make_fdr_story_card(photo_bytes: bytes, title: str, body_text: str) -> Bytes
     draw.rectangle([0, photo_h+header_h, FDR_STORY_W, FDR_STORY_H], fill=(0, 0, 0))
     pad = 34
     h_box = (pad, photo_h+pad, FDR_STORY_W-pad, photo_h+header_h-pad)
-    b_box = (pad, photo_h+header_h+pad, FDR_STORY_W-pad, FDR_STORY_H-pad)
+    # Текст приподнят ближе к фото (было photo_h+header_h+pad)
+    bottom_reserve = (STORY_LINK_BOX_BOTTOM_MARGIN + STORY_LINK_BOX_H + 20) if border else pad
+    b_box = (pad, photo_h + header_h + int(pad * 0.4),
+             FDR_STORY_W - pad, FDR_STORY_H - bottom_reserve)
     tf, tg, tpg = _fit_story_text(draw, title, h_box, 28, 54, 0.08, 0.18)
     _draw_story_text(draw, title, h_box, tf, line_gap=tg, paragraph_gap_extra=tpg)
     bf, bg, bpg = _fit_story_text(draw, body_text, b_box, 14, 30, 0.10, 0.32)
-    _draw_story_text(draw, body_text, b_box, bf, align="left", valign="top", line_gap=bg, paragraph_gap_extra=bpg)
+    _draw_story_text(draw, body_text, b_box, bf, align="left", valign="top",
+                     line_gap=bg, paragraph_gap_extra=bpg)
+    if border:
+        draw_link_border(canvas)
     out = BytesIO()
     canvas.save(out, format="JPEG", quality=92, optimize=True)
     out.seek(0)
     return out
 
 
-def make_news_story_card(photo_bytes: bytes, news_text: str, highlight_phrase: str) -> BytesIO:
+def make_news_story_card(photo_bytes: bytes, news_text: str, highlight_phrase: str,
+                         border: bool = False) -> BytesIO:
     ensure_fonts()
     canvas = Image.new("RGB", (FDR_STORY_W, FDR_STORY_H), (255, 255, 255))
     draw = ImageDraw.Draw(canvas)
@@ -595,12 +649,15 @@ def make_news_story_card(photo_bytes: bytes, news_text: str, highlight_phrase: s
         return r.crop((l, t, l+tw, t+th))
 
     canvas.paste(fit_cover(photo, photo_size, photo_size), ((FDR_STORY_W-photo_size)//2, photo_top))
-    news_top = photo_top + photo_size + 60
-    news_box = (50, news_top, FDR_STORY_W-50, FDR_STORY_H-80)
-    nf, ng, npg = _fit_story_text(draw, news_text.upper(), news_box, 24, 52, 0.12, 0.30)
+    # Текст приподнят ближе к фото (было + 60)
+    news_top = photo_top + photo_size + 30
+    bottom_reserve = (STORY_LINK_BOX_BOTTOM_MARGIN + STORY_LINK_BOX_H + 20) if border else 80
+    news_box = (50, news_top, FDR_STORY_W-50, FDR_STORY_H - bottom_reserve)
+    news_upper = strip_leading_emoji(news_text).upper()
+    nf, ng, npg = _fit_story_text(draw, news_upper, news_box, 24, 52, 0.12, 0.30)
     hl_upper = highlight_phrase.strip().upper()
     hl_words = set(hl_upper.split()) if hl_upper else set()
-    lines = _wrap_paragraphs(draw, news_text.upper(), nf, news_box[2]-news_box[0])
+    lines = _wrap_paragraphs(draw, news_upper, nf, news_box[2]-news_box[0])
     lh = nf.getbbox("Ag")[3] - nf.getbbox("Ag")[1]
     total_h = sum(npg if l == "" else lh+ng for l in lines)
     y = news_box[1] + (news_box[3]-news_box[1]-total_h)//2
@@ -618,6 +675,8 @@ def make_news_story_card(photo_bytes: bytes, news_text: str, highlight_phrase: s
             if i < len(words)-1:
                 x += text_width(draw, " ", nf)
         y += lh + ng
+    if border:
+        draw_link_border(canvas)
     out = BytesIO()
     canvas.save(out, format="JPEG", quality=92, optimize=True)
     out.seek(0)
@@ -638,20 +697,24 @@ def post_preview_kb():
     return kb
 
 
-def story_preview_kb():
+def story_preview_kb(border_on: bool = False):
     kb = InlineKeyboardMarkup()
     kb.row(InlineKeyboardButton("✏️ Изменить текст", callback_data="edit_story_body"),
            InlineKeyboardButton("✏️ Изменить заголовок", callback_data="edit_story_title"))
+    toggle = "🔲 Убрать обводку" if border_on else "🔳 Добавить прямоугольную обводку"
+    kb.row(InlineKeyboardButton(toggle, callback_data="toggle_story_border"))
     kb.row(InlineKeyboardButton("🔄 Создать заново", callback_data="restart_story"),
            InlineKeyboardButton("✅ Готово", callback_data="finish_story"))
     kb.row(InlineKeyboardButton("❌ Отмена", callback_data="cancel_story"))
     return kb
 
 
-def news_story_preview_kb():
+def news_story_preview_kb(border_on: bool = False):
     kb = InlineKeyboardMarkup()
     kb.row(InlineKeyboardButton("✏️ Изменить новость", callback_data="edit_news_text"),
            InlineKeyboardButton("💜 Изменить выделение", callback_data="edit_news_highlight"))
+    toggle = "🔲 Убрать обводку" if border_on else "🔳 Добавить прямоугольную обводку"
+    kb.row(InlineKeyboardButton(toggle, callback_data="toggle_news_border"))
     kb.row(InlineKeyboardButton("🔄 Создать заново", callback_data="restart_news_story"),
            InlineKeyboardButton("✅ Готово", callback_data="finish_news_story"))
     kb.row(InlineKeyboardButton("❌ Отмена", callback_data="cancel_news_story"))
@@ -808,7 +871,7 @@ def on_action(call):
                     if line.strip():
                         first_line = line.strip()
                         break
-            st["news_text"] = clean_markdown(first_line)
+            st["news_text"] = strip_leading_emoji(clean_markdown(first_line))
             logger.info(f"STORY first_line='{st['news_text'][:80]}' "
                         f"(title_len={len(title)}, body_len={len(raw)})")
         st["step"] = "waiting_news_highlight"
@@ -827,19 +890,21 @@ def on_action(call):
         st["step"] = "waiting_post_body"; user_state[uid] = st
         bot.answer_callback_query(call.id, "Ок")
         bot.edit_message_caption(chat_id=call.message.chat.id, message_id=call.message.message_id,
-                                 caption="📝 Пришли новый ОСНОВНОЙ ТЕКСТ:")
+                                 caption="📝 Пришли новый ОСНОВНОЙ ТЕКСТ:",
+                                 reply_markup=post_preview_kb())
     elif call.data == "edit_post_title":
         st["step"] = "waiting_post_title"; user_state[uid] = st
         bot.answer_callback_query(call.id, "Ок")
         bot.edit_message_caption(chat_id=call.message.chat.id, message_id=call.message.message_id,
-                                 caption="📝 Пришли новый ЗАГОЛОВОК:")
+                                 caption="📝 Пришли новый ЗАГОЛОВОК:",
+                                 reply_markup=post_preview_kb())
     elif call.data == "edit_post_highlight":
         st["step"] = "waiting_post_highlight"; user_state[uid] = st
         bot.answer_callback_query(call.id, "Ок")
         bot.edit_message_caption(chat_id=call.message.chat.id, message_id=call.message.message_id,
-                                 caption="💜 Пришли новую ФРАЗУ:")
+                                 caption="💜 Пришли новую ФРАЗУ:",
+                                 reply_markup=post_preview_kb())
     elif call.data == "restart_post":
-        # После «Создать заново» — сбрасываем всё и ждём новое фото/репост
         user_state[uid] = {"step": "idle"}
         bot.answer_callback_query(call.id, "Заново")
         bot.delete_message(call.message.chat.id, call.message.message_id)
@@ -849,7 +914,6 @@ def on_action(call):
     elif call.data == "finish_post":
         bot.answer_callback_query(call.id, "✅")
         bot.send_message(call.message.chat.id, "✅ Готово!", reply_markup=main_menu_kb())
-        # СБРОС: чтобы следующий репост сразу ловился
         user_state[uid] = {"step": "idle"}
     elif call.data == "cancel_post":
         bot.answer_callback_query(call.id, "❌")
@@ -862,12 +926,40 @@ def on_action(call):
         st["step"] = "waiting_news_text"; user_state[uid] = st
         bot.answer_callback_query(call.id, "Ок")
         bot.edit_message_caption(chat_id=call.message.chat.id, message_id=call.message.message_id,
-                                 caption="📝 Пришли новый текст новости:")
+                                 caption="📝 Пришли новый текст новости:",
+                                 reply_markup=news_story_preview_kb(st.get("story_border", False)))
     elif call.data == "edit_news_highlight":
         st["step"] = "waiting_news_highlight"; user_state[uid] = st
         bot.answer_callback_query(call.id, "Ок")
         bot.edit_message_caption(chat_id=call.message.chat.id, message_id=call.message.message_id,
-                                 caption="💜 Пришли новую ФРАЗУ:")
+                                 caption="💜 Пришли новую ФРАЗУ:",
+                                 reply_markup=news_story_preview_kb(st.get("story_border", False)))
+    elif call.data == "toggle_news_border":
+        st["story_border"] = not st.get("story_border", False)
+        st["step"] = "waiting_news_story_action"
+        user_state[uid] = st
+        try:
+            card = make_news_story_card(
+                st["photo_bytes"], st["news_text"],
+                st.get("highlight_phrase", ""), border=st["story_border"]
+            )
+            st["card_bytes"] = card.getvalue()
+            bot.edit_message_media(
+                chat_id=call.message.chat.id,
+                message_id=st.get("preview_message_id") or call.message.message_id,
+                media=telebot.types.InputMediaPhoto(
+                    BytesIO(st["card_bytes"]),
+                    caption="📱 Сторис",
+                    parse_mode="HTML",
+                ),
+                reply_markup=news_story_preview_kb(st["story_border"]),
+            )
+            user_state[uid] = st
+            bot.answer_callback_query(call.id, "Обводка обновлена")
+        except Exception as e:
+            logger.error(f"toggle_news_border error: {e}")
+            bot.answer_callback_query(call.id, "Ошибка")
+        return
     elif call.data == "restart_news_story":
         user_state[uid] = {"step": "idle"}
         bot.answer_callback_query(call.id, "Заново")
@@ -890,12 +982,39 @@ def on_action(call):
         st["step"] = "waiting_story_body"; user_state[uid] = st
         bot.answer_callback_query(call.id, "Ок")
         bot.edit_message_caption(chat_id=call.message.chat.id, message_id=call.message.message_id,
-                                 caption="📝 Пришли новый текст:")
+                                 caption="📝 Пришли новый текст:",
+                                 reply_markup=story_preview_kb(st.get("story_border", False)))
     elif call.data == "edit_story_title":
         st["step"] = "waiting_story_title"; user_state[uid] = st
         bot.answer_callback_query(call.id, "Ок")
         bot.edit_message_caption(chat_id=call.message.chat.id, message_id=call.message.message_id,
-                                 caption="📝 Пришли новый заголовок:")
+                                 caption="📝 Пришли новый заголовок:",
+                                 reply_markup=story_preview_kb(st.get("story_border", False)))
+    elif call.data == "toggle_story_border":
+        st["story_border"] = not st.get("story_border", False)
+        st["step"] = "waiting_story_action"
+        user_state[uid] = st
+        try:
+            card = make_fdr_story_card(
+                st["photo_bytes"], st["title"], st["body_raw"],
+                border=st["story_border"]
+            )
+            st["card_bytes"] = card.getvalue()
+            bot.edit_message_media(
+                chat_id=call.message.chat.id,
+                message_id=st.get("preview_message_id") or call.message.message_id,
+                media=telebot.types.InputMediaPhoto(
+                    BytesIO(st["card_bytes"]),
+                    caption="📱 Сторис",
+                ),
+                reply_markup=story_preview_kb(st["story_border"]),
+            )
+            user_state[uid] = st
+            bot.answer_callback_query(call.id, "Обводка обновлена")
+        except Exception as e:
+            logger.error(f"toggle_story_border error: {e}")
+            bot.answer_callback_query(call.id, "Ошибка")
+        return
     elif call.data == "restart_story":
         user_state[uid] = {"step": "idle"}
         bot.answer_callback_query(call.id, "Заново")
@@ -1163,7 +1282,7 @@ def on_text(message):
     if step == "waiting_post_title":
         if not text:
             bot.reply_to(message, "❌ Пустой заголовок."); return
-        st["title"] = clean_markdown(text)
+        st["title"] = clean_markdown(strip_leading_emoji(text))
         st["step"] = "waiting_post_highlight"
         user_state[uid] = st
         bot.reply_to(message, f"✅ Заголовок: <b>{html.escape(st['title'])}</b>\n\n💜 Пришли <b>ФРАЗУ</b>:",
@@ -1219,9 +1338,11 @@ def on_text(message):
             bot.reply_to(message, "❌ Пустая фраза."); return
         st["highlight_phrase"] = text if text.lower() != "нет" else ""
         try:
-            card = make_news_story_card(st["photo_bytes"], st["news_text"], st.get("highlight_phrase", ""))
+            card = make_news_story_card(st["photo_bytes"], st["news_text"],
+                                        st.get("highlight_phrase", ""),
+                                        border=st.get("story_border", False))
             msg = bot.send_photo(message.chat.id, photo=card, caption="📱 Сторис",
-                                 reply_markup=news_story_preview_kb())
+                                 reply_markup=news_story_preview_kb(st.get("story_border", False)))
             bot.send_message(message.chat.id, "✅ Готово!", reply_markup=main_menu_kb())
             st["step"] = "waiting_news_story_action"
             st["card_bytes"] = card.getvalue()
@@ -1237,11 +1358,15 @@ def on_text(message):
             bot.reply_to(message, "❌ Пустой текст."); return
         st["news_text"] = text
         try:
-            card = make_news_story_card(st["photo_bytes"], st["news_text"], st.get("highlight_phrase", ""))
+            card = make_news_story_card(st["photo_bytes"], st["news_text"],
+                                        st.get("highlight_phrase", ""),
+                                        border=st.get("story_border", False))
+            st["card_bytes"] = card.getvalue()
             bot.edit_message_media(
                 chat_id=message.chat.id,
                 message_id=st.get("preview_message_id"),
-                media=telebot.types.InputMediaPhoto(card, caption="📱 Обновлено")
+                media=telebot.types.InputMediaPhoto(BytesIO(st["card_bytes"]), caption="📱 Обновлено"),
+                reply_markup=news_story_preview_kb(st.get("story_border", False)),
             )
             st["step"] = "waiting_news_story_action"
             user_state[uid] = st
@@ -1254,7 +1379,7 @@ def on_text(message):
     if step == "waiting_story_title":
         if not text:
             bot.reply_to(message, "❌ Пустой заголовок."); return
-        st["title"] = clean_markdown(text)
+        st["title"] = clean_markdown(strip_leading_emoji(text))
         st["step"] = "waiting_story_body"
         user_state[uid] = st
         bot.reply_to(message, f"✅ Заголовок: <b>{html.escape(st['title'])}</b>\n\nОтправь <b>ТЕКСТ</b>:", parse_mode="HTML")
@@ -1265,9 +1390,10 @@ def on_text(message):
             bot.reply_to(message, "❌ Пустой текст."); return
         st["body_raw"] = text
         try:
-            card = make_fdr_story_card(st["photo_bytes"], st["title"], st["body_raw"])
+            card = make_fdr_story_card(st["photo_bytes"], st["title"], st["body_raw"],
+                                       border=st.get("story_border", False))
             msg = bot.send_photo(message.chat.id, photo=card, caption="📱 Сторис",
-                                 reply_markup=story_preview_kb())
+                                 reply_markup=story_preview_kb(st.get("story_border", False)))
             bot.send_message(message.chat.id, "✅ Готово!", reply_markup=main_menu_kb())
             st["step"] = "waiting_story_action"
             st["card_bytes"] = card.getvalue()
